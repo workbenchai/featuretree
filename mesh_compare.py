@@ -5,9 +5,12 @@ tree, and its edges are soft, so this does three modest things by slicing the me
 
   measure   the stepped outline (each level's diameter and height), the holes at each level
             (round, or a regular polygon with its across-flats size), and how far each rim is
-            broken (chamfer / round), with the slice spacing as the resolution;
+            broken (chamfer / round), with the slice spacing as the resolution; --relief also
+            maps the body's off-axis relief into classified patches (insets, panels, ribs);
   tree      for round stepped parts with through holes, a feature tree built from those
-            measurements: one size per recognised shape, so a hexagon comes out regular;
+            measurements: one size per recognised shape, so a hexagon comes out regular; rim
+            breaks that measured as a 45-degree chamfer or a quarter round become chamfer /
+            fillet features, and a blank scan band between shrinking levels becomes a cone;
   compare   a volumetric overlap (IoU) between the mesh and an IR spec's solid, summed over
             slices, after centring both and searching the spin about Z.
 
@@ -116,12 +119,29 @@ def _radius(sec):
 def _rim_break(mesh, z_end, inward, body, reach=2.0, step=0.05, tol=0.1):
     """How a level's outline falls away as it nears its end face at `z_end` (`inward` = +1 if the
     level lies above that face, -1 below): (height over which it is more than `tol` short of the
-    body radius, radius lost at the last whole slice). (0, 0) is a sharp edge at this resolution."""
+    body radius, radius lost at the last whole slice, shape, size). (0, 0, None, None) is a sharp
+    edge at this resolution.
+
+    The shape is read by fitting both profiles a designer would have asked for: each sample `h`
+    in from the face and `d` short of the body gives one estimate of a 45-degree chamfer's size
+    (h + d) and one of a quarter round's radius (h + d + sqrt(2 h d)); whichever family of
+    estimates agrees on one value names the break — "chamfer" or "round", with `size` that value
+    — and when neither agrees (a taper, a torn rim) both are None."""
     zs = z_end + inward * np.arange(step, reach, step)
     short = [(abs(z - z_end), body - _radius(s)) for z, s in zip(zs, slices(mesh, zs))
              if s is not None and abs(_radius(s) - body) < 3.0]
     broken = [(h, d) for h, d in short if d > tol]
-    return (round(max(h for h, _ in broken), 2), round(max(d for _, d in broken), 2)) if broken else (0.0, 0.0)
+    if not broken:
+        return 0.0, 0.0, None, None
+    hs, ds = np.array([h for h, _ in broken]), np.array([d for _, d in broken])
+    shape = size = best = None
+    if len(broken) >= 4:
+        for name, est in (("chamfer", hs + ds), ("round", hs + ds + np.sqrt(2 * hs * ds))):
+            med = float(np.median(est))
+            spread = float(np.percentile(est, 90) - np.percentile(est, 10))
+            if med > 0 and spread <= max(0.1, 0.2 * med) and (best is None or spread < best):
+                shape, size, best = name, round(med, 2), spread
+    return round(float(hs.max()), 2), round(float(ds.max()), 2), shape, size
 
 
 def _holes(mesh, z_lo, z_hi):
@@ -143,8 +163,14 @@ def _holes(mesh, z_lo, z_hi):
     return sorted(best, key=lambda h: -h["diameter"])
 
 
+def _break_dict(brk):
+    h, d, shape, size = brk
+    return {"height": h, "radius_lost": d} | ({"shape": shape, "size": size} if shape else {})
+
+
 def measure(mesh, dz=0.25, min_height=1.0):
-    """Levels of the stepped outline, bottom to top, each with its holes and rim breaks. Slices
+    """Levels of the stepped outline, bottom to top, each with its holes and rim breaks (each
+    break named "chamfer" or "round" with a fitted size when its profile reads as one). Slices
     are `dz` apart; rims are re-sliced every 0.05 mm."""
     z0, z1 = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
     zs = np.arange(z0 + dz / 2, z1, dz)
@@ -157,20 +183,131 @@ def measure(mesh, dz=0.25, min_height=1.0):
         lo, hi = float(zs[i] - dz / 2), float(zs[j] + dz / 2)
         if not np.isnan(rad[i]) and hi - lo >= min_height:             # thinner = a face being crossed
             body = float(np.median(rad[i:j + 1]))
-            bh, bd = _rim_break(mesh, lo, +1, body)
-            th, td = _rim_break(mesh, hi, -1, body)
-            ext = _largest(slices(mesh, [(lo + hi) / 2])[0]).exterior
+            # an open scan can miss the level's exact midpoint; fall back to slices known to exist
+            sec = next((s for zq in ((lo + hi) / 2, zs[(i + j) // 2], zs[i], zs[j])
+                        for s in slices(mesh, [zq]) if s is not None), None)
+            if sec is None:
+                i = j + 1
+                continue
+            ext = _largest(sec).exterior
             ep = _ring_points(ext, 360)
             er = np.hypot(ep[:, 0] - ext.centroid.x, ep[:, 1] - ext.centroid.y)
             levels.append({"z": [round(lo, 2), round(hi, 2)], "height": round(hi - lo, 2),
                            "outer_diameter": round(2 * body, 2),
                            "centre": [round(ext.centroid.x, 2), round(ext.centroid.y, 2)],
                            "round": bool(er.max() - er.min() < 0.02 * er.max() + 0.2),
-                           "bottom_break": {"height": bh, "radius_lost": bd},
-                           "top_break": {"height": th, "radius_lost": td},
+                           "bottom_break": _break_dict(_rim_break(mesh, lo, +1, body)),
+                           "top_break": _break_dict(_rim_break(mesh, hi, -1, body)),
                            "holes": _holes(mesh, lo, hi)})
         i = j + 1
     return {"extents": [round(float(v), 2) for v in mesh.extents], "slice_spacing": dz, "levels": levels}
+
+
+def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
+    """What the outline carries AROUND the axis that the stepped levels cannot say: the radius
+    binned every 360/`nth` degrees at every `dz` of height, minus each slice's own median (the
+    axisymmetric baseline), segmented where it leaves ±`tol` mm into patches of at least
+    `min_area` mm². Each patch is classified by sign and angular coverage — a "recess" or "boss"
+    (an inset switch well, a grip panel, a moulded pad) — with its z span, centre angle and
+    angular span, depth (the deep decile, so a soft rim does not dilute a flat floor), mean body
+    radius there, arc width, area, and `fill` (how much of its bounding box it covers: 1.0 is a
+    clean rectangle). A full "ring_rib" / "ring_groove" is axisymmetric and so invisible to the
+    residual; those are read off the baseline instead, as a bump or dip in base(z) that returns
+    to the surrounding radius (which a step shoulder does not).
+    Angles are about the mean slice centroid (`axis_xy`); `noise` is the median |residual|."""
+    import scipy.ndimage as ndi
+    z0, z1 = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+    zs = np.arange(z0 + dz, z1 - dz / 2, dz)
+    secs = slices(mesh, zs)
+    ax = np.mean([_largest(s).exterior.centroid.coords[0] for s in secs if s is not None], axis=0)
+    R = np.full((len(zs), nth), np.nan)
+    for i, s in enumerate(secs):
+        if s is None:
+            continue
+        ext = _largest(s).exterior
+        pts = np.asarray(ext.segmentize(max(ext.length / (2 * nth), 0.05)).coords)
+        th = np.arctan2(pts[:, 1] - ax[1], pts[:, 0] - ax[0])
+        b = (th / (2 * np.pi) * nth).astype(int) % nth
+        r = np.hypot(pts[:, 0] - ax[0], pts[:, 1] - ax[1])
+        sums, cnt = np.zeros(nth), np.zeros(nth)
+        np.add.at(sums, b, r)
+        np.add.at(cnt, b, 1)
+        R[i, cnt > 0] = sums[cnt > 0] / cnt[cnt > 0]
+    rows_ok = ~np.isnan(R).all(axis=1)
+    base = np.full(len(zs), np.nan)
+    base[rows_ok] = np.nanmedian(R[rows_ok], axis=1)
+    res = R - base[:, None]
+    valid = ~np.isnan(res)
+    r0 = np.where(valid, res, 0.0)
+    patches = []
+
+    # a full ring rib / groove is axisymmetric, so it hides in the baseline itself, not in the
+    # residual: a bump (or dip) in base(z) that RETURNS to the surrounding radius — a step does not
+    idx = np.arange(len(zs))
+    filled = np.interp(idx, idx[rows_ok], base[rows_ok]) if rows_ok.any() else base
+    smooth = ndi.median_filter(filled, size=max(3, int(7 / dz) | 1), mode="nearest")
+    dev = filled - smooth
+    run = None
+    for i in list(np.flatnonzero(np.abs(dev) > tol)) + [None]:
+        if run and (i is None or i != run[-1] + 1 or np.sign(dev[i]) != np.sign(dev[run[0]])):
+            i0, i1 = run[0], run[-1]
+            before, after = filled[max(i0 - 1, 0)], filled[min(i1 + 1, len(zs) - 1)]
+            rm = (before + after) / 2
+            area = 2 * np.pi * rm * (i1 - i0 + 1) * dz
+            if abs(before - after) <= 2 * tol and area >= min_area:     # it returns: not a shoulder
+                d = float(np.percentile(np.abs(filled[i0:i1 + 1] - rm), 90))
+                patches.append({"kind": "ring_rib" if dev[i0] > 0 else "ring_groove",
+                                "z": [round(float(zs[i0] - dz / 2), 2), round(float(zs[i1] + dz / 2), 2)],
+                                "theta_deg": [0.0, 360.0], "depth": round(d, 2),
+                                "mean_radius": round(float(rm), 2),
+                                "arc_mm": round(2 * np.pi * float(rm), 1),
+                                "area_mm2": round(float(area), 1), "fill": 1.0})
+            run = None
+        if i is not None:
+            run = (run + [i]) if run else [i]
+    for kind, mask in (("recess", r0 < -tol), ("boss", r0 > tol)):
+        lab, _ = ndi.label(mask, structure=np.ones((3, 3), int))
+        for i in range(len(zs)):                       # one surface: join patches across theta = 0
+            a, b2 = lab[i, 0], lab[i, -1]
+            if a and b2 and a != b2:
+                lab[lab == b2] = a
+        def _ang(cols_):
+            bins_ = np.unique(cols_)
+            gaps_ = np.diff(np.concatenate([bins_, [bins_[0] + nth]]))
+            span_ = nth - int(gaps_.max()) + 1
+            start_ = bins_[(int(np.argmax(gaps_)) + 1) % len(bins_)]
+            centre_ = ((start_ + (span_ - 1) / 2) % nth + 0.5) * 360.0 / nth
+            return len(bins_), span_, centre_
+
+        for L in np.unique(lab)[1:]:
+            cells = np.argwhere(lab == L)
+            rows, cols = cells[:, 0], cells[:, 1]
+            rm = float(np.nanmean(base[np.unique(rows)]))
+            area = len(cells) * rm * (2 * np.pi / nth) * dz
+            if area < min_area:
+                continue
+            vals = res[lab == L]
+            depth = float(abs(np.percentile(vals, 10 if kind == "recess" else 90)))
+            nbins, span, centre = _ang(cols)
+            fill = len(cells) / (span * (rows.max() - rows.min() + 1))
+            deep = np.abs(vals) >= 0.6 * depth                 # the floor, past the walls' ramp
+            _, fspan, fcentre = _ang(cols[deep])
+            frows = rows[deep]
+            patches.append({"kind": ("ring_groove" if kind == "recess" else "ring_rib")
+                            if nbins >= 0.97 * nth else kind,
+                            "z": [round(float(zs[rows.min()] - dz / 2), 2),
+                                  round(float(zs[rows.max()] + dz / 2), 2)],
+                            "theta_deg": [round(float(centre), 1), round(span * 360.0 / nth, 1)],
+                            "depth": round(depth, 2), "mean_radius": round(rm, 2),
+                            "arc_mm": round(rm * span * 2 * np.pi / nth, 1),
+                            "area_mm2": round(area, 1), "fill": round(float(fill), 2),
+                            "floor": {"z": [round(float(zs[frows.min()] - dz / 2), 2),
+                                            round(float(zs[frows.max()] + dz / 2), 2)],
+                                      "theta_deg": [round(float(fcentre), 1),
+                                                    round(fspan * 360.0 / nth, 1)]}})
+    patches.sort(key=lambda p: -p["area_mm2"])
+    return {"axis_xy": [round(float(ax[0]), 2), round(float(ax[1]), 2)], "dz": dz, "tol": tol,
+            "noise": round(float(np.nanmedian(np.abs(res[valid]))), 3), "patches": patches}
 
 
 def _snap(v, grid=0.5, within=0.3):
@@ -187,27 +324,78 @@ def tree(measured, snap=True):
     Each recognised shape becomes the feature a designer would use, with one size: a step is a
     circle and a pad; a regular hexagon is an ngon with one across-flats value (so it is regular
     by construction, whatever the scan's six sides measure); equally spaced holes at one radius
-    become one bolt circle with one diameter. With `snap`, sizes within 0.3 mm of a 0.5 mm step
-    take that value. Anything it cannot describe raises ValueError or is listed in the notes."""
+    become one bolt circle with one diameter; a rim break whose profile measured as a 45-degree
+    chamfer or a quarter round becomes that chamfer() / fillet(); a blank band in the scan between
+    two levels with falling diameter is bridged by a tapered pad (a cone); and when `measured`
+    carries a "relief" entry (see relief()), each rectangular-enough recess patch becomes a
+    radial prism_cut — a flat-floored inset — while every other patch is a note. With `snap`,
+    sizes within 0.3 mm of a 0.5 mm step take that value. Anything it cannot describe raises
+    ValueError or is listed in the notes."""
     import ir as IR
     sn = _snap if snap else (lambda v, *a, **k: round(v, 3))
     levels, notes = measured["levels"], []
-    if not levels or not all(lv["round"] for lv in levels):
-        raise ValueError("only parts made of round steps along Z are handled")
+    bumpy = [lv for lv in levels if not lv["round"]]
+    if not levels or (bumpy and not measured.get("relief")):
+        raise ValueError("only parts made of round steps along Z are handled "
+                         "(measure the relief to let textured steps through)")
+    if bumpy:
+        notes.append(f"{len(bumpy)} level(s) read as round although the scan is not axisymmetric "
+                     f"there; the deviation is in the relief patches")
     ax = np.mean([lv["centre"] for lv in levels], axis=0)                # the part's axis
-    cuts = [levels[0]["z"][0]] + [(a["z"][1] + b["z"][0]) / 2 for a, b in zip(levels, levels[1:])] \
-        + [levels[-1]["z"][1]]
-    feats, prev = [], None
+    diam = [sn(lv["outer_diameter"]) for lv in levels]
+    bounds = []                            # between levels i and i+1: ("mid", z, z) or ("cone", lo, hi)
+    for a, b, da, db in zip(levels, levels[1:], diam, diam[1:]):
+        gap = b["z"][0] - a["z"][1]
+        if gap >= 1.0 and db <= da - 1.0:
+            bounds.append(("cone", a["z"][1], b["z"][0]))
+        else:
+            if gap >= 1.0:
+                notes.append(f"scan blank z {a['z'][1]}..{b['z'][0]} with dia {da} -> {db}: "
+                             f"left as a square shoulder midway")
+            m = (a["z"][1] + b["z"][0]) / 2
+            bounds.append(("mid", m, m))
+    starts = [levels[0]["z"][0]] + [bd[2] for bd in bounds]
+    ends = [bd[1] for bd in bounds] + [levels[-1]["z"][1]]
+    feats, breaks, prev, coned = [], [], None, set()
     for i, lv in enumerate(levels):
-        d, h = sn(lv["outer_diameter"]), sn(cuts[i + 1] - cuts[i])
+        d, h = diam[i], sn(ends[i] - starts[i])
         feats.append(IR.sketch(f"step{i + 1}_outline", circles=[(0, 0, d / 2)],
                                on={"face_of": prev, "side": "top"} if prev else None))
         prev = f"step{i + 1}"
         feats.append(IR.pad(prev, f"step{i + 1}_outline", h))
-        for end in ("bottom_break", "top_break"):
-            if lv[end]["height"] >= 0.5 and lv[end]["radius_lost"] >= 0.5 and not (i == 0 and end == "bottom_break"):
-                notes.append(f"{prev}: {end.replace('_', ' ')} of {lv[end]['height']} x {lv[end]['radius_lost']} mm "
-                             f"seen but not modelled")
+        if i < len(bounds) and bounds[i][0] == "cone":
+            run, dn = round(bounds[i][2] - bounds[i][1], 2), diam[i + 1]
+            ang = round(math.degrees(math.atan2((d - dn) / 2, run)), 1)
+            feats.append(IR.sketch(f"cone{i + 1}_outline", circles=[(0, 0, d / 2)],
+                                   on={"face_of": prev, "side": "top"}))
+            prev = f"cone{i + 1}"
+            feats.append(IR.pad(prev, f"cone{i + 1}_outline", run, taper=ang))
+            notes.append(f"{prev}: scan blank z {bounds[i][1]}..{bounds[i][2]} bridged by a cone, "
+                         f"dia {d} -> {dn} ({ang} deg)")
+            coned |= {(i, "top_break"), (i + 1, "bottom_break")}
+        for end, side in (("bottom_break", "bottom"), ("top_break", "top")):
+            br = lv[end]
+            if br["height"] < 0.5 or br["radius_lost"] < 0.5 \
+                    or (i == 0 and end == "bottom_break") or (i, end) in coned:
+                continue
+            seen = f"{end.replace('_', ' ')} of {br['height']} x {br['radius_lost']} mm"
+            nd = diam[i + 1] if end == "top_break" and i + 1 < len(levels) else \
+                diam[i - 1] if end == "bottom_break" and i > 0 else None
+            if nd is not None and nd >= d - 0.5:               # the rim edge is swallowed by the neighbour
+                notes.append(f"step{i + 1}: {seen} seen but not modelled")
+                continue
+            size = sn(br["size"]) if br.get("size") else None
+            fits = size and size > 0 and (nd is None or size <= (d - nd) / 2 + 0.3)
+            if br.get("shape") == "round" and fits:
+                breaks.append(IR.fillet(f"step{i + 1}_{side}_round", size,
+                                        {"edges_of": f"step{i + 1}", "side": side}))
+                notes.append(f"step{i + 1}: {seen} modelled as a {size} mm round")
+            elif br.get("shape") == "chamfer" and fits:
+                breaks.append(IR.chamfer(f"step{i + 1}_{side}_chamfer", size,
+                                         {"edges_of": f"step{i + 1}", "side": side}))
+                notes.append(f"step{i + 1}: {seen} modelled as a {size} mm chamfer")
+            else:
+                notes.append(f"step{i + 1}: {seen} seen but not modelled")
 
     holes = []                                   # merged across levels: [hole, set of level indices]
     for i, lv in enumerate(levels):
@@ -269,7 +457,85 @@ def tree(measured, snap=True):
         else:
             feats.append(IR.sketch(f"{name}_profile", circles=[(c[0], c[1], sn(h["diameter"]) / 2)]))
         feats.append(IR.pocket(name, f"{name}_profile", through=True))
-    return IR.part("part", *feats), notes
+
+    pats = (measured.get("relief") or {}).get("patches", [])
+    for p in pats:
+        if p["kind"] != "recess":
+            notes.append(f"{p['kind'].replace('_', ' ')} z {p['z'][0]}..{p['z'][1]} at "
+                         f"{p['theta_deg'][0]} deg ({p['theta_deg'][1]} deg wide), {p['depth']} mm: "
+                         f"seen but not modelled")
+    panels = []        # one moulded panel often scans as bands between the ribs that cross it
+    for p in sorted((p for p in pats if p["kind"] == "recess"), key=lambda p: p["z"][0]):
+        for g in panels:
+            if abs((g["theta"] - p["theta_deg"][0] + 180) % 360 - 180) <= 15 \
+                    and abs(g["rm"] - p["mean_radius"]) <= 1.5 and p["z"][0] - g["z"][1] <= 4.0:
+                g["bands"].append(p)
+                g["z"][1] = max(g["z"][1], p["z"][1])
+                g["span"] = max(g["span"], p["theta_deg"][1])
+                g["fz"][1] = max(g["fz"][1], p["floor"]["z"][1])
+                g["fspan"] = max(g["fspan"], p["floor"]["theta_deg"][1])
+                break
+        else:
+            panels.append({"bands": [p], "z": list(p["z"]), "theta": p["theta_deg"][0],
+                           "span": p["theta_deg"][1], "rm": p["mean_radius"],
+                           "fz": list(p["floor"]["z"]), "fspan": p["floor"]["theta_deg"][1]})
+    for k, g in enumerate(panels):
+        bands = g["bands"]
+        atot = sum(b["area_mm2"] for b in bands)
+        ang = math.degrees(math.atan2(
+            sum(b["area_mm2"] * math.sin(math.radians(b["theta_deg"][0])) for b in bands),
+            sum(b["area_mm2"] * math.cos(math.radians(b["theta_deg"][0])) for b in bands))) % 360
+        rm = sum(b["mean_radius"] * b["area_mm2"] for b in bands) / atot
+        t_raw = float(np.median([b["depth"] for b in bands]))
+        t = sn(t_raw)
+        fill = max(b["fill"] for b in bands)
+        where = f"z {g['z'][0]}..{g['z'][1]} at {round(ang, 1)} deg ({g['span']} deg wide)" \
+            + (f", {len(bands)} scan bands" if len(bands) > 1 else "")
+        if fill < 0.6 or t < 0.3 or g["span"] > 120:
+            notes.append(f"recess {where}, {t} mm deep (fill {fill}): "
+                         f"seen but not rectangular enough to model")
+            continue
+        if t_raw > 1.5 * (g["fz"][1] - g["fz"][0]):        # deeper than tall: a dome or shoulder
+            notes.append(f"recess {where}, {t} mm deep but only "
+                         f"{round(g['fz'][1] - g['fz'][0], 2)} mm tall: a curved end face seen "
+                         f"edge-on, not a moulded recess; left out")
+            continue
+        # the walls' draft, from the two contours the patch measured: its outline sits where the
+        # residual crosses -tol (near the mouth), its floor where it passes 0.6 x depth — the run
+        # between them, over that residual drop, is the wall's slope. The chords use each
+        # contour's own radius, and a resolution slop (half an angular bin + a quarter slice) is
+        # taken off the run so a vertical wall does not read as drafted.
+        rel = measured["relief"]
+        w = 2 * (rm - rel.get("tol", 0.3)) * math.sin(math.radians(g["span"]) / 2)
+        h = g["z"][1] - g["z"][0]
+        wf = min(2 * (rm - 0.8 * t_raw) * math.sin(math.radians(g["fspan"]) / 2), w)
+        hf = min(g["fz"][1] - g["fz"][0], h)
+        if wf < 1.5 or hf < 1.0:
+            wf, hf = w, h
+        drop = max(0.6 * t_raw - rel.get("tol", 0.3), 0.2)
+        slop = rm * math.pi / 360 / 2 + rel.get("dz", 0.5) / 4
+        ramp = max(((w - wf) / 2 + (h - hf) / 2) / 2 - slop, 0.0)
+        taper = -round(min(math.degrees(math.atan2(ramp, drop)), 70.0), 1)
+        wf, hf = sn(wf), sn(hf)
+        rc = round(min(2.5, wf / 4, hf / 4), 2)                           # moulded corners
+        B = -0.41421356       # tan(90/4), negative: on a CCW loop the convex corner bows RIGHT
+        # of travel, and _geom's positive bulge bows left (found by SolidCraft's taper check —
+        # the other kernels silently built the concave corners)
+        poly = [(-wf / 2 + rc, -hf / 2, 0), (wf / 2 - rc, -hf / 2, B), (wf / 2, -hf / 2 + rc, 0),
+                (wf / 2, hf / 2 - rc, B), (wf / 2 - rc, hf / 2, 0), (-wf / 2 + rc, hf / 2, B),
+                (-wf / 2, hf / 2 - rc, 0), (-wf / 2, -hf / 2 + rc, B)]
+        phi = math.radians(ang)
+        sag = rm - math.sqrt(max(rm * rm - (max(w, wf) / 2) ** 2, 0.0))
+        zc = (g["z"][0] + g["z"][1]) / 2 - levels[0]["z"][0]
+        breaks.append(IR.prism_cut(f"inset{k + 1}",
+                                   origin=[(rm - t) * math.cos(phi), (rm - t) * math.sin(phi), zc],
+                                   normal=[math.cos(phi), math.sin(phi), 0.0],
+                                   xdir=[-math.sin(phi), math.cos(phi), 0.0],
+                                   depth=round(t + sag + 1.0, 2), polys=[poly], taper=taper))
+        notes.append(f"inset{k + 1}: recess {where} modelled as a moulded cut: {wf} x {hf} mm "
+                     f"floor, {t} mm deep, walls drafted {abs(taper)} deg, corners r {rc}"
+                     + (" (texture crossing the panel is cut away)" if len(bands) > 1 else ""))
+    return IR.part("part", *feats, *breaks), notes
 
 
 def spec_mesh(spec):
@@ -284,8 +550,11 @@ def spec_mesh(spec):
 
 def compare(spec, mesh, n=80, scale=False):
     """Volumetric overlap of the spec's solid with the mesh. Both are centred on their XY bounding
-    boxes and stood on z = 0; the spin about Z is searched. With `scale` the spec is first scaled
-    to the mesh's largest extent. Returns {"iou_pct", "spin_deg", "scale", "dvol_pct"}."""
+    boxes and stood on z = 0; the spin about Z is searched. A height inside the mesh's own extent
+    where it has no closed cross-section (an open scan band) is missing data, not empty space:
+    those slices are left out of the overlap, and each body's volume is its mean measured slice
+    area times its own height. With `scale` the spec is first scaled to the mesh's largest extent.
+    Returns {"iou_pct", "spin_deg", "scale", "dvol_pct"}."""
     from shapely import affinity
     k = 1.0
     if scale:
@@ -307,6 +576,8 @@ def compare(spec, mesh, n=80, scale=False):
         inter = union = 0.0
         for i in idx:
             p, q = sa[i], sb[i]
+            if p is None and zs[i] < a.extents[2]:        # the mesh is open here: no data
+                continue
             if p is None or q is None:
                 union += (p or q).area if (p or q) is not None else 0.0
                 continue
@@ -318,8 +589,8 @@ def compare(spec, mesh, n=80, scale=False):
     few = range(0, n, max(1, n // 10))
     best = max(np.arange(0, 360, 2.0), key=lambda d: iou(d, few))
     best = max(np.arange(best - 2, best + 2.01, 0.25), key=lambda d: iou(d, few))
-    va = sum(s.area for s in sa if s is not None) * top / n
-    vb = sum(s.area for s in sb if s is not None) * top / n
+    va = float(np.mean([s.area for s in sa if s is not None])) * float(a.extents[2])
+    vb = float(np.mean([s.area for s in sb if s is not None])) * float(b.extents[2])
     return {"iou_pct": round(100 * iou(best, range(n)), 2), "spin_deg": round(float(best) % 360, 2),
             "scale": round(k, 4), "dvol_pct": round(100 * (vb - va) / va, 2)}
 
@@ -331,17 +602,29 @@ def main():
     ap.add_argument("--spec", help="IR JSON (or an image_recognize result) to compare")
     ap.add_argument("--scale", action="store_true", help="scale the spec to the mesh's largest extent")
     ap.add_argument("--tree", metavar="OUT", help="build a feature tree from the measurements and write it here")
+    ap.add_argument("--relief", action="store_true",
+                    help="also map the off-axis relief (insets, panels, ribs) and model what fits")
     ap.add_argument("--emit", help="write the measurements (and comparison) as JSON")
     a = ap.parse_args()
     mesh = load(a.mesh)
     out = {"mesh": os.path.basename(a.mesh), "measured": measure(mesh)}
     m = out["measured"]
+    if a.relief:
+        m["relief"] = relief(mesh)
+        print(f"relief: noise {m['relief']['noise']} mm, {len(m['relief']['patches'])} patch(es)")
+        for p in m["relief"]["patches"]:
+            print(f"  {p['kind']}  z {p['z'][0]}..{p['z'][1]}  at {p['theta_deg'][0]} deg "
+                  f"({p['theta_deg'][1]} deg / {p['arc_mm']} mm wide)  depth {p['depth']}  "
+                  f"area {p['area_mm2']} mm2  fill {p['fill']}")
     print(f"{out['mesh']}: extents {m['extents']} mm, sliced every {m['slice_spacing']} mm")
     for lv in m["levels"]:
         bb, tb = lv["bottom_break"], lv["top_break"]
+
+        def _b(b):
+            return f"{b['height']} x {b['radius_lost']}" + \
+                (f" ({b['shape']} {b['size']})" if b.get("shape") else "")
         print(f"  z {lv['z'][0]:.1f}..{lv['z'][1]:.1f}  dia {lv['outer_diameter']}  height {lv['height']}"
-              f"  rim break (height x radius lost): bottom {bb['height']} x {bb['radius_lost']}, "
-              f"top {tb['height']} x {tb['radius_lost']}")
+              f"  rim break (height x radius lost): bottom {_b(bb)}, top {_b(tb)}")
         for h in lv["holes"]:
             what = (f"{h['shape']}, flats {h['flat_pairs']}, {h['across_corners']} across corners "
                     f"(sharp would be {h['ideal_across_corners']}), first corner at {h['first_corner_deg']} deg" if "sides" in h
