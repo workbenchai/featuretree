@@ -7,7 +7,9 @@ description: >-
   when a part should be inspectable/editable in FreeCAD's parametric tree, not handed off as a
   dead STEP/STL solid (which imports as one frozen lump). Supports rectangle, circle, AND
   arbitrary polygon / profile-with-holes sketches, pads, pockets (through/blind), and
-  query-selected fillets. The SAME IR also emits to a native Onshape Part Studio (REST) —
+  query-selected fillets. The SAME IR also emits to a SolidCraft command script
+  (solidcraft_emit.py -> solidcraft-cli, volume-verified against build123d) and to a native
+  Onshape Part Studio (REST) —
   sketches, pad, pocket, fillet, revolve and axis-aligned placed cuts — so one design drives FreeCAD and Onshape. Requires the FreeCAD AppImage
   (auto-located at /opt, override with FREECAD_APPIMAGE / FREECAD_CMD); the Onshape backend needs
   an Onshape API key + `pip install shapely`.

@@ -379,6 +379,7 @@ Tests: `tests/test_assembly_loops.py`, `tests/test_threemf_emit.py`.
 | `fc_common.py` | FreeCAD's Python 3.11 | shared FreeCAD-side helpers |
 | `onshape_client.py` | host Python 3 | Onshape REST client (HMAC) — create a doc, run FeatureScript |
 | `onshape_emit.py` | host Python 3 | emit an IR spec → a native Onshape Part Studio (REST, query-string references) |
+| `solidcraft_emit.py` | host Python 3 | emit an IR spec → a SolidCraft command script (`solidcraft-cli run`; `--verify` gates the volume against build123d) |
 | `script_emit.py` | host Python 3 | emit an IR spec → a Fusion or SolidWorks build script (`targets/`) |
 | `targets/*.py` | inside Fusion / SolidWorks | the runtime each generated script carries |
 | `cad_verify.py` | host Python 3 | check a target's STEP, `.sldprt` or `.f3d` against the IR (IoU + tree) |
