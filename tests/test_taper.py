@@ -5,7 +5,7 @@ FreeCAD emitter maps it onto PartDesign's TaperAngle with FC_TAPER_SIGN; the par
 the same tapered IR in both backends and requires equal volumes, which is what pins that sign.
 """
 import math
-import shutil
+import conftest
 
 import pytest
 
@@ -52,7 +52,7 @@ def test_drafted_cavity_pocket_shrinks_going_in():
     assert abs(res["volume"] - (100 * 100 * 50 - _frustum(80, 40, 2.0))) < 1.0
 
 
-@pytest.mark.skipif(shutil.which("xvfb-run") is None, reason="FreeCAD parity needs the AppImage")
+@pytest.mark.skipif(not conftest.has_freecad(), reason="FreeCAD parity needs a freecadcmd")
 def test_freecad_taper_matches_build123d(tmp_path):
     """Pins FC_TAPER_SIGN: the same tapered IR must give the same volume in FreeCAD."""
     import gen
@@ -77,7 +77,7 @@ def test_tapered_prism_cut_volume():
     assert abs(res["volume"] - (100 * 100 * 50 - _frustum(80, 40, 2.0))) < 1.0
 
 
-@pytest.mark.skipif(shutil.which("xvfb-run") is None, reason="FreeCAD parity needs the AppImage")
+@pytest.mark.skipif(not conftest.has_freecad(), reason="FreeCAD parity needs a freecadcmd")
 def test_freecad_tapered_prism_cut_matches_build123d(tmp_path):
     """Pins FC_PRISM_TAPER_SIGN (prism_cut is a REVERSED Pocket in FreeCAD). Checked to fail with
     the sign flipped (FreeCAD 234956 vs build123d 252836 mm^3)."""

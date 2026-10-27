@@ -1,6 +1,6 @@
 """Chamfers, edge queries by feature ({"edges_of": ...}) and regular-polygon sketches."""
 import math
-import shutil
+import conftest
 
 import pytest
 
@@ -92,7 +92,7 @@ def test_chamfer_edit_reads_back():
     assert spec["features"][-1]["distance"] == 3.5
 
 
-@pytest.mark.skipif(shutil.which("xvfb-run") is None, reason="FreeCAD parity needs the AppImage")
+@pytest.mark.skipif(not conftest.has_freecad(), reason="FreeCAD parity needs a freecadcmd")
 def test_freecad_builds_the_same_edge_breaks(tmp_path):
     import gen
     spec = _bushing(IR.chamfer("rim", 2, {"edges_of": "boss", "side": "top"}),

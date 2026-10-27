@@ -57,6 +57,39 @@ def _add_poly(sk, pts):
             sk.addGeometry(Part.Arc(p1, mid, p2), False)
 
 
+def _sample_arcs(pts, per_arc=24):
+    """The poly with every bulge arc replaced by `per_arc` chords. A tapered Pocket's draft fails
+    on arc segments (OCC hands back an invalid shape, exactly as build123d's offset does), so a
+    drafted profile goes in as fine chords — the draft itself is exact either way."""
+    v = [(float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0) for p in pts]
+    out = []
+    n = len(v)
+    for i in range(n):
+        x1, y1, b = v[i]
+        out.append((x1, y1))
+        if abs(b) < 1e-4:
+            continue
+        x2, y2, _ = v[(i + 1) % n]
+        chord = math.hypot(x2 - x1, y2 - y1)
+        if chord < 1e-9:
+            continue
+        sag = b * chord / 2.0
+        ux, uy = (x2 - x1) / chord, (y2 - y1) / chord       # left normal = (-uy, ux)
+        rad = ((chord / 2) ** 2 + sag ** 2) / (2 * sag)     # signed, like the sagitta
+        ox, oy = (x1 + x2) / 2 - uy * (sag - rad), (y1 + y2) / 2 + ux * (sag - rad)
+        mx, my = (x1 + x2) / 2 - uy * sag, (y1 + y2) / 2 + ux * sag
+        a0 = math.atan2(y1 - oy, x1 - ox)
+        # the sweep that passes through the pushed midpoint (the sign of 4 atan(b) does not
+        # follow this file's bulge convention for both bows)
+        half = (math.atan2(my - oy, mx - ox) - a0) % (2 * math.pi)
+        sweep = 2 * half if half <= math.pi else 2 * half - 4 * math.pi
+        r = math.hypot(x1 - ox, y1 - oy)
+        for k in range(1, per_arc):
+            a = a0 + sweep * k / per_arc
+            out.append((ox + r * math.cos(a), oy + r * math.sin(a)))
+    return out
+
+
 def _map_poly(poly, inv, zref):
     """Map a poly's (x, y[, bulge]) vertices from global coords into a sketch's local frame via the
     placement inverse `inv` (bulge is orientation-free, carried through)."""
@@ -191,7 +224,10 @@ def build(spec, out_path):
             sk.AttachmentSupport = [(dp, "")]
             sk.MapMode = "FlatFace"
             doc.recompute()
-            for poly in f["polys"]:                 # polys are already in the plane's local (u, v) frame
+            polys = f["polys"]                      # polys are already in the plane's local (u, v) frame
+            if f.get("taper") and any(len(p) > 2 and abs(float(p[2])) > 1e-4 for poly in polys for p in poly):
+                polys = [_sample_arcs(p) for p in polys]
+            for poly in polys:
                 _add_poly(sk, poly)
             p = body.newObject("PartDesign::Pocket", f["name"])
             p.Label = f["name"]

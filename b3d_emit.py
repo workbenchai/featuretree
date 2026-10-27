@@ -378,7 +378,12 @@ def _emit(spec):
             # ledge annulus), silently over-cutting.
             nrm = tuple(f["normal"])
             pl = Plane(origin=tuple(f["origin"]), x_dir=tuple(f["xdir"]), z_dir=nrm)
-            region = _polys_region(f["polys"], pl)
+            polys = f["polys"]
+            if f.get("taper") and any(len(p) > 2 and abs(p[2]) > 1e-9 for poly in polys for p in poly):
+                # a tapered extrude offsets the wire, and that offset fails on arc segments:
+                # sample the arcs into chords first (the draft itself is exact either way)
+                polys = [_G.poly_points(p, per_arc=24) for p in polys]
+            region = _polys_region(polys, pl)
             if region is not None:
                 part = _cut(part, extrude(region, amount=f["depth"], dir=nrm, taper=f.get("taper", 0.0)))
             params[f["name"]] = {"depth": round(float(f["depth"]), 4)}
