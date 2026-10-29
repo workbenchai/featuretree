@@ -235,6 +235,83 @@ def _floor_outline(field, level, cols, zs, nth, rm, tol_mm=0.35):
     return [[round(float(np.degrees(u / rm)), 2), round(float(v), 2)] for u, v in pts]
 
 
+def _skeleton_path(skel, nth):
+    """The skeleton's diameter as an ordered pixel path: BFS from anywhere to the farthest
+    pixel, then BFS back — the longest geodesic through the line, branches ignored. The grid
+    wraps in theta (columns)."""
+    from collections import deque
+    px = {(int(r), int(c)) for r, c in np.argwhere(skel)}
+
+    def bfs(start):
+        seen, far = {start: None}, start
+        q = deque([start])
+        while q:
+            p = q.popleft()
+            far = p
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    n = (p[0] + dr, (p[1] + dc) % nth)
+                    if n in px and n not in seen:
+                        seen[n] = p
+                        q.append(n)
+        return far, seen
+    a, _ = bfs(next(iter(px)))
+    b, parents = bfs(a)
+    path, p = [], b
+    while p is not None:
+        path.append(p)
+        p = parents[p]
+    return path
+
+
+def _detail_lines(res, zs, nth, base, tol, min_len=8.0, max_width=3.0):
+    """LINE detailing in the residual — carved grooves and embossed ridges: each sign's
+    well-past-noise mask, skeletonized; components that are narrow for their length (a line,
+    not a panel) walked into an ordered (theta_deg, z) path with one width and depth each.
+    Everything line-like but shorter than `min_len` is summarized, not pathed."""
+    import scipy.ndimage as ndi
+    from skimage.morphology import skeletonize
+    rm = float(np.nanmedian(base))
+    cw = rm * 2 * np.pi / nth
+    ch = float(zs[1] - zs[0]) if len(zs) > 1 else 0.5
+    out = {}
+    for sign, key in ((-1, "carved"), (1, "embossed")):
+        lines, short = [], {"count": 0, "length_mm": 0.0, "area_mm2": 0.0}
+        lab, _ = ndi.label(sign * res > 2 * tol, structure=np.ones((3, 3), int))
+        for i in range(lab.shape[0]):                  # one surface: join across theta = 0
+            a, b = lab[i, 0], lab[i, -1]
+            if a and b and a != b:
+                lab[lab == b] = a
+        for L in np.unique(lab)[1:]:
+            sel = lab == L
+            skel = skeletonize(sel)
+            slen = float(skel.sum()) * (cw + ch) / 2
+            area = float(sel.sum()) * cw * ch
+            width = area / max(slen, 1e-6)
+            if width > max_width or slen < 3 * width:
+                continue                               # a panel or a blob, not a line
+            if slen < min_len:
+                short["count"] += 1
+                short["length_mm"] += slen
+                short["area_mm2"] += area
+                continue
+            path = _skeleton_path(skel, nth)
+            pts = [((c + 0.5) * 360.0 / nth, float(zs[r])) for r, c in path]
+            keep = pts[::max(1, len(pts) // max(int(slen / 2.0), 2))]     # ~a point every 2 mm
+            if keep[-1] != pts[-1]:
+                keep.append(pts[-1])
+            rows = [r for r, _ in path]
+            lines.append({"path": [[round(t, 2), round(z, 2)] for t, z in keep],
+                          "width": round(width, 2),
+                          "depth": round(float(np.median(np.abs(res[sel]))), 2),
+                          "length_mm": round(slen, 1),
+                          "radius": round(float(np.nanmedian(base[rows])), 2)})
+        lines.sort(key=lambda e: -e["length_mm"])
+        short = {k: round(v, 1) for k, v in short.items()}
+        out[key] = {"lines": lines, "short": short}
+    return out
+
+
 def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
     """What the outline carries AROUND the axis that the stepped levels cannot say: the radius
     binned every 360/`nth` degrees at every `dz` of height, minus each slice's own median (the
@@ -348,6 +425,7 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
             # it, because a slice's outer ring reads the rib ENVELOPE, not the body
             "base_z": [round(float(z), 2) for z in zs[rows_ok]],
             "base_r": [round(float(r), 3) for r in base[rows_ok]],
+            "detail": _detail_lines(r0, zs, nth, base, tol),
             "patches": patches}
 
 
@@ -618,6 +696,37 @@ def tree(measured, snap=True):
                          f"seen but not modelled")
     for pkind, sgn, fname in (("recess", -1, "inset"), ("boss", 1, "boss")):
         _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes)
+    det = (measured.get("relief") or {}).get("detail")
+    if det:
+        # line detailing — carved contour lines, embossed ridges — lands as named, dimensioned
+        # ENGRAVE features: reference by default (ir.engrave), so the tree carries the design
+        # intent without turning every rebuild into hundreds of micro-booleans
+        gaps = [a["z"][1] for a, b in zip(levels, levels[1:]) if b["z"][0] - a["z"][1] > 1.0]
+        torn_above = gaps[-1] if gaps else None
+        z0f = levels[0]["z"][0]
+        k = 0
+        for side, key in (("carve", "carved"), ("emboss", "embossed")):
+            kept = 0
+            for e in det.get(key, {}).get("lines", []):
+                zmid = (e["path"][0][1] + e["path"][-1][1]) / 2
+                # the same honesty gates the panels carry: nothing from above the scan's last
+                # torn band, and nothing from the first couple of millimetres, where an end
+                # face read edge-on writes fictional lines into the residual
+                if (torn_above is not None and zmid > torn_above) or zmid < z0f + 2.0:
+                    continue
+                k += 1
+                kept += 1
+                breaks.append(IR.engrave(f"line{k}", [(t, z - z0f) for t, z in e["path"]],
+                                         e["width"], e["depth"], side=side, radius=e["radius"]))
+            if kept:
+                tot = sum(e["length_mm"] for e in det[key]["lines"])
+                notes.append(f"{kept} {key} line(s), {round(tot)} mm of path in all, kept as "
+                             f"reference engravings (ir.engrave, build=False)")
+            sh = det.get(key, {}).get("short", {})
+            if sh.get("count"):
+                notes.append(f"{key} texture: {sh['count']} segments under 8 mm "
+                             f"({sh['length_mm']} mm, {sh['area_mm2']} mm2) — a texture field, "
+                             f"not modelled")
     breaks = _coalesce_patterns(breaks, notes)
     return IR.part("part", *feats, *breaks), notes
 

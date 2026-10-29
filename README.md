@@ -113,6 +113,11 @@ json.dump(spec, open("bracket.ir.json", "w"))            # then: python3 gen.py 
 - `pattern(name, of, count, angle_step=… | z_step=…)` — repeat an earlier placed feature about +Z
   (polar) or along it (a stack). One editable count and one step — the design intent a ring of pads
   actually carries. `ir.lower()` expands the copies, so no backend needs to know the feature exists.
+- `engrave(name, path, width, depth, side="carve"|"emboss", radius)` — line detailing on a
+  cylindrical surface: a carved groove or embossed ridge following a (θ, z) path with one width
+  and one depth. **Reference by default** — the tree carries the measured design intent, every
+  backend skips it alike, and volumes stay comparable; `build=True` has `lower()` expand it into
+  placed prism segments when the booleans are wanted.
 - `polar_pocket(name, radius, length, mount_r, z, count, phase)` — a ring of tangent bores.
 - `fillet(name, radius, select={"circles": "top_outer"})` — edges chosen by **query**, re-resolved to
   live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
@@ -332,9 +337,13 @@ the baseline curve rides along for tree().
 - Evenly spaced look-alikes collapse into one master + `ir.pattern` — four thumb pads come back
   as *one* boss repeated 4 × 90°, unified on the median depth and draft (the two noisiest
   estimates).
+- Line detailing — carved contour lines, embossed ridges, logo-style line art — is skeletonized
+  out of the residual into **reference `engrave` features**: a named path with one measured width
+  and depth each, in the tree without turning every rebuild into hundreds of micro-booleans.
+  Sub-8 mm segments are summarized as a texture field.
 - What can't be said honestly is a **note, never a guess**: too shallow, too wrapped, too
-  shapeless — and everything above the scan's last torn band, where slice data mixes the outer
-  wall with interior cavities into fictional features.
+  shapeless — and everything above the scan's last torn band or in the first millimetres of an
+  end face, where slice data writes fictional features into the residual.
 
 **Score.** `compare()` reports slice-overlap IoU with a spin search — useful, but it cannot credit
 a cavity the scanner never resolved (a torn hex socket reads as *solid*). The honest number is the

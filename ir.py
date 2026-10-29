@@ -169,6 +169,51 @@ def _pattern_copy(src, name, angle_deg, dz):
     return g
 
 
+def engrave(name, path, width, depth, side="carve", radius=None, build=False):
+    """Line detailing on a cylindrical surface about +Z: a carved groove (`side="carve"`) or an
+    embossed ridge (`side="emboss"`) following `path` — [(theta_deg, z), ...] in surface
+    coordinates at `radius` — with one `width` and one `depth` (a scan reads a moulded part's
+    whole detailing at one tool setting). REFERENCE by default: the feature carries the measured
+    design intent, every backend skips it alike, and volumes stay comparable. With `build=True`,
+    lower() expands it into placed prism segments (hundreds of small booleans on a long path —
+    ask for it deliberately)."""
+    if side not in ("carve", "emboss"):
+        raise ValueError(f"engrave {name!r}: side must be 'carve' or 'emboss'")
+    return {"kind": "engrave", "name": name, "side": side, "radius": radius,
+            "width": float(width), "depth": float(depth), "build": bool(build),
+            "path": [[round(float(t), 2), round(float(z), 2)] for t, z in path]}
+
+
+def _engrave_prisms(f):
+    """An engrave feature as placed prism segments: one shallow box per path chord, each in its
+    own tangent frame, overlapping its neighbours so the chain has no gaps."""
+    import math
+    r, w, d = f["radius"], f["width"], f["depth"]
+    sgn = -1 if f["side"] == "carve" else 1
+    out = []
+    pts = f["path"]
+    for j, (a, b) in enumerate(zip(pts, pts[1:])):
+        ta, tb = math.radians(a[0]), math.radians(b[0])
+        mt, mz = (ta + tb) / 2, (a[1] + b[1]) / 2
+        seg = math.hypot(r * ((tb - ta + math.pi) % (2 * math.pi) - math.pi), b[1] - a[1])
+        if seg < 1e-3:
+            continue
+        ang = math.atan2(b[1] - a[1], r * ((tb - ta + math.pi) % (2 * math.pi) - math.pi))
+        c, s = math.cos(mt), math.sin(mt)
+        half, hw = seg / 2 + w / 4, w / 2
+        ca, sa = math.cos(ang), math.sin(ang)
+        poly = [(u * ca - v * sa, u * sa + v * ca, 0)
+                for u, v in ((-half, -hw), (half, -hw), (half, hw), (-half, hw))]
+        r0 = r + sgn * d
+        out.append({"kind": "prism_cut" if sgn < 0 else "prism_pad",
+                    "name": f"{f['name']}_{j + 1}",
+                    "origin": [round(r0 * c, 6), round(r0 * s, 6), round(mz, 6)],
+                    "normal": [round(sgn * -c, 6), round(sgn * -s, 6), 0.0],
+                    "xdir": [round(sgn * s, 6), round(sgn * -c, 6), 0.0],
+                    "depth": round(d + 1.0, 3), "polys": [[list(p) for p in poly]]})
+    return out
+
+
 def part(name, *features):
     return {"name": name, "features": list(features)}
 
@@ -192,13 +237,16 @@ def lower(spec):
     import math
     G = _geom()
     out = copy.deepcopy(spec)
-    feats = []                           # patterns expand first: backends never see them
-    for f in out["features"]:
+    feats = []                           # patterns and engravings expand first: backends never
+    for f in out["features"]:            # see either kind
         if f["kind"] == "pattern":
             src = next(g for g in feats if g.get("name") == f["of"])
             for i in range(1, f["count"]):
                 feats.append(_pattern_copy(src, f"{f['name']}_{i}",
                                            f.get("angle_step", 0.0) * i, f.get("z_step", 0.0) * i))
+        elif f["kind"] == "engrave":
+            if f.get("build"):           # reference detailing stays out of the solid
+                feats.extend(_engrave_prisms(f))
         else:
             feats.append(f)
     out["features"] = feats
@@ -402,6 +450,12 @@ def validate(spec):
                 problems.append(f"{n}: a pattern needs count >= 2")
             if ("angle_step" in f) == ("z_step" in f):
                 problems.append(f"{n}: give exactly one of angle_step / z_step")
+        elif k == "engrave":
+            if len(f.get("path") or []) < 2:
+                problems.append(f"{n}: an engraving needs a path of at least 2 points")
+            if not (f.get("width") or 0) > 0 or not (f.get("depth") or 0) > 0 \
+                    or not (f.get("radius") or 0) > 0:
+                problems.append(f"{n}: an engraving needs positive width, depth and radius")
     return problems
 
 
