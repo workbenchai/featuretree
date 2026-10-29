@@ -371,8 +371,9 @@ def _emit(spec):
                 cutter = cyl if cutter is None else cutter + cyl
             part = _cut(part, cutter)
             params[f["name"]] = {"count": n, "radius": round(float(r), 4)}
-        elif kind == "prism_cut":
-            # a profile in the plane {origin, x_dir, normal}, extruded `depth` along +normal, cut.
+        elif kind in ("prism_cut", "prism_pad"):
+            # a profile in the plane {origin, x_dir, normal}, extruded `depth` along +normal,
+            # cut from the running solid — or fused onto it (prism_pad: a recovered rib / boss).
             # Extrude along the EXPLICIT normal (dir=), not the region face's own normal — the latter
             # depends on poly winding and would cut the wrong way for a hole-in-region (e.g. a pocket
             # ledge annulus), silently over-cutting.
@@ -384,9 +385,22 @@ def _emit(spec):
                 # sample the arcs into chords first (the draft itself is exact either way)
                 polys = [_G.poly_points(p, per_arc=24) for p in polys]
             region = _polys_region(polys, pl)
+            taper = f.get("taper", 0.0)
             if region is not None:
-                part = _cut(part, extrude(region, amount=f["depth"], dir=nrm, taper=f.get("taper", 0.0)))
-            params[f["name"]] = {"depth": round(float(f["depth"]), 4)}
+                # the tapered extrude offsets the profile wire by depth*tan(taper), and on a
+                # concave traced outline that offset can self-intersect and the loft refuse;
+                # the draft matters less than the cut, so back it off until the kernel accepts
+                while True:
+                    try:
+                        tool = extrude(region, amount=f["depth"], dir=nrm, taper=taper)
+                        part = (part + tool) if kind == "prism_pad" else _cut(part, tool)
+                        break
+                    except Exception:
+                        if abs(taper) < 5.0:
+                            raise
+                        taper = round(taper / 2.0, 1)
+            params[f["name"]] = {"depth": round(float(f["depth"]), 4),
+                                 **({"taper": taper} if f.get("taper") else {})}
         else:
             raise ValueError(f"unknown feature kind: {kind}")
         volumes.append(None if part is None else round(float(part.volume), 3))

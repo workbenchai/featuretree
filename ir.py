@@ -125,6 +125,50 @@ def prism_cut(name, origin, normal, xdir, depth, polys=(), taper=0.0):
             "polys": [[list(p) for p in poly] for poly in polys]} | ({"taper": float(taper)} if taper else {})
 
 
+def prism_pad(name, origin, normal, xdir, depth, polys=(), taper=0.0):
+    """prism_cut's additive twin: the same placed profile, extruded `depth` along +normal and
+    FUSED onto the running solid. This is how recovered RAISED features land — a grip rib, a
+    boss, a moulded pad standing proud of the body. Sink the profile's base a little inside the
+    body (and size `depth` to cover the body's curvature) so the union never meets the surface
+    tangentially. `taper` as for prism_cut: positive shrinks the profile along +normal."""
+    return {"kind": "prism_pad", "name": name,
+            "origin": [round(float(c), 6) for c in origin],
+            "normal": [round(float(c), 6) for c in normal],
+            "xdir": [round(float(c), 6) for c in xdir], "depth": depth,
+            "polys": [[list(p) for p in poly] for poly in polys]} | ({"taper": float(taper)} if taper else {})
+
+
+def pattern(name, of, count, angle_step=None, z_step=None):
+    """Repeat an earlier PLACED feature (prism_cut / prism_pad): `count` instances in all, the
+    original included. POLAR: each next instance is the original rotated `angle_step` degrees
+    about +Z. LINEAR: lifted `z_step` mm along +Z. One editable step and one count — the design
+    intent a ring of pads or a moulded rib stack actually carries, instead of n near-copies.
+    lower() expands the repeats, so no backend needs to know the feature exists."""
+    if (angle_step is None) == (z_step is None):
+        raise ValueError(f"pattern {name!r}: give exactly one of angle_step / z_step")
+    d = {"kind": "pattern", "name": name, "of": of, "count": int(count)}
+    if angle_step is not None:
+        d["angle_step"] = float(angle_step)
+    else:
+        d["z_step"] = float(z_step)
+    return d
+
+
+def _pattern_copy(src, name, angle_deg, dz):
+    """One expanded pattern instance: `src` spun `angle_deg` about +Z and lifted `dz`."""
+    import copy
+    import math
+    c, s = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+    rot = lambda v: [c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]]
+    g = copy.deepcopy(src)
+    g["name"] = name
+    g["origin"] = [round(x, 6) for x in rot(src["origin"])]
+    g["origin"][2] = round(g["origin"][2] + dz, 6)
+    g["normal"] = [round(x, 6) for x in rot(src["normal"])]
+    g["xdir"] = [round(x, 6) for x in rot(src["xdir"])]
+    return g
+
+
 def part(name, *features):
     return {"name": name, "features": list(features)}
 
@@ -148,6 +192,16 @@ def lower(spec):
     import math
     G = _geom()
     out = copy.deepcopy(spec)
+    feats = []                           # patterns expand first: backends never see them
+    for f in out["features"]:
+        if f["kind"] == "pattern":
+            src = next(g for g in feats if g.get("name") == f["of"])
+            for i in range(1, f["count"]):
+                feats.append(_pattern_copy(src, f"{f['name']}_{i}",
+                                           f.get("angle_step", 0.0) * i, f.get("z_step", 0.0) * i))
+        else:
+            feats.append(f)
+    out["features"] = feats
     zlo = zhi = None                     # the part's extent so far
     sk, pads, made = {}, [], {}          # sketch -> (z0, side, loops); pads; feature name -> record
 
@@ -238,7 +292,7 @@ def update_from_params(spec, params):
             f["distance"] = p["distance"]
         if f["kind"] == "revolve" and "angle" in p:
             f["angle"] = p["angle"]
-        if f["kind"] == "prism_cut" and ("depth" in p or "length" in p):
+        if f["kind"] in ("prism_cut", "prism_pad") and ("depth" in p or "length" in p):
             f["depth"] = p.get("depth", p.get("length"))   # FreeCAD holds a placed cut as a Pocket: 'length'
         if f["kind"] == "sketch" and "radii" in p:
             for i, r in enumerate(p["radii"]):
@@ -264,12 +318,12 @@ def validate(spec):
       pocket     a taper needs a blind pocket; a blind pocket needs a positive length
       edges      a fillet / chamfer has a positive size; {"edges_of": f} names an earlier pad or
                  pocket and resolves to at least one edge
-      placement  prism_cut normal and xdir are non-zero and orthogonal
+      placement  prism_cut / prism_pad normal and xdir are non-zero and orthogonal
 
     Loop checks need shapely; without it they are skipped and reported as one problem."""
     import math
     G = _geom()
-    problems, seen, sketches, solids = [], set(), set(), set()
+    problems, seen, sketches, solids, placed = [], set(), set(), set(), set()
     for f in spec["features"]:               # before lowering: a bad ngon cannot be expanded
         for g in (f.get("ngons") or []) if f["kind"] == "sketch" else []:
             if len(g) < 3 or not g[2] > 0 or (len(g) > 3 and int(g[3]) < 3):
@@ -335,11 +389,19 @@ def validate(spec):
                 problems.append(f"{n}: blind pocket needs a positive length")
             if k == "pocket" and f["through"] and f.get("taper"):
                 problems.append(f"{n}: taper on a through pocket")
-        elif k == "prism_cut":
+        elif k in ("prism_cut", "prism_pad"):
             nn, xx = f["normal"], f["xdir"]
             if not any(nn) or not any(xx) or abs(sum(a * b for a, b in zip(nn, xx))) > 1e-6:
                 problems.append(f"{n}: normal and xdir must be non-zero and orthogonal")
             loops_ok(n, G.sketch_loops(polys=f["polys"]))
+            placed.add(n)
+        elif k == "pattern":
+            if f["of"] not in placed:
+                problems.append(f"{n}: pattern 'of' must name an earlier prism_cut / prism_pad")
+            if not f["count"] >= 2:
+                problems.append(f"{n}: a pattern needs count >= 2")
+            if ("angle_step" in f) == ("z_step" in f):
+                problems.append(f"{n}: give exactly one of angle_step / z_step")
     return problems
 
 

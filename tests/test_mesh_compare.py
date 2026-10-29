@@ -166,6 +166,49 @@ def test_tree_cuts_the_inset_it_found(switched):
     assert MC.compare(made, mesh)["iou_pct"] > 99
 
 
+def test_a_moulded_boss_comes_back_as_a_prism_pad():
+    spec = IR.part(
+        "ribbed",
+        IR.sketch("body_outline", circles=[(0, 0, 20)]),
+        IR.pad("body", "body_outline", 40),
+        IR.prism_pad("pad1", origin=[21.5, 0, 20], normal=[-1, 0, 0], xdir=[0, -1, 0],
+                     depth=4, polys=[[(-5, -4, 0), (5, -4, 0), (5, 4, 0), (-5, 4, 0)]],
+                     taper=-30.0),                       # stands ~1.5 proud, walls drafted
+    )
+    mesh = MC.spec_mesh(spec)
+    m = MC.measure(mesh)
+    m["relief"] = MC.relief(mesh)
+    made, notes = MC.tree(m)
+    pads = [f for f in made["features"] if f["kind"] == "prism_pad"]
+    assert len(pads) == 1
+    assert pads[0]["depth"] > 1.0                        # tall enough to cross the surface
+    assert any("modelled as a moulded pad" in n for n in notes)
+    assert not IR.validate(made)
+    assert MC.compare(made, mesh)["iou_pct"] > 99
+
+
+def test_a_ring_of_bosses_comes_back_as_one_pattern():
+    spec = IR.part(
+        "ringed",
+        IR.sketch("body_outline", circles=[(0, 0, 20)]),
+        IR.pad("body", "body_outline", 40),
+        IR.prism_pad("pad1", origin=[21.5, 0, 20], normal=[-1, 0, 0], xdir=[0, -1, 0],
+                     depth=4, polys=[[(-5, -4, 0), (5, -4, 0), (5, 4, 0), (-5, 4, 0)]]),
+        IR.pattern("pad_ring", "pad1", count=4, angle_step=90.0),
+    )
+    mesh = MC.spec_mesh(spec)
+    m = MC.measure(mesh)
+    m["relief"] = MC.relief(mesh)
+    made, notes = MC.tree(m)
+    pads = [f for f in made["features"] if f["kind"] == "prism_pad"]
+    rings = [f for f in made["features"] if f["kind"] == "pattern"]
+    assert len(pads) == 1 and len(rings) == 1          # four scans of one design decision
+    assert rings[0]["count"] == 4 and rings[0]["angle_step"] == pytest.approx(90.0, abs=2.0)
+    assert any("polar ring" in n for n in notes)
+    assert not IR.validate(made)
+    assert MC.compare(made, mesh)["iou_pct"] > 99
+
+
 def test_a_moulded_well_comes_back_drafted_and_rounded():
     B = -0.41421356                            # quarter-round corners, convex on a CCW loop
     well = [(-4 + 2, -3, 0), (4 - 2, -3, B), (4, -3 + 2, 0), (4, 3 - 2, B),
@@ -184,7 +227,15 @@ def test_a_moulded_well_comes_back_drafted_and_rounded():
     cuts = [f for f in made["features"] if f["kind"] == "prism_cut"]
     assert len(cuts) == 1
     assert -55 <= cuts[0]["taper"] <= -20                               # the draft is measured
-    assert any(abs(b) > 0.3 for seg in cuts[0]["polys"][0] for b in seg[2:])   # corners are arcs
+    poly = cuts[0]["polys"][0]
+    # the shape comes back either as the traced floor outline (the corner rounding carried by
+    # its many chords) or as the rounded-rect fallback (the rounding carried by arc bulges)
+    traced = len(poly) > 8 and not any(abs(b) > 0.3 for seg in poly for b in seg[2:])
+    if traced:
+        us, vs = [p[0] for p in poly], [p[1] for p in poly]
+        assert 6.0 < max(us) - min(us) < 9.5 and 4.0 < max(vs) - min(vs) < 7.5   # the 8 x 6 floor
+    else:
+        assert any(abs(b) > 0.3 for seg in poly for b in seg[2:])       # corners are arcs
     assert any("moulded cut" in n and "drafted" in n for n in notes)
     assert not IR.validate(made)
     assert MC.compare(made, mesh)["iou_pct"] > 99

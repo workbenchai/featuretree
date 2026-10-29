@@ -28,6 +28,16 @@ FC_TAPER_SIGN = -1.0
 FC_PRISM_TAPER_SIGN = -1.0
 
 
+def _broken(o):
+    """A feature whose last recompute failed: an error state, or no shape behind it."""
+    try:
+        if any(s in ("Invalid", "RecomputeFailed", "Error") for s in getattr(o, "State", [])):
+            return True
+        return o.Shape.isNull()
+    except Exception:
+        return True
+
+
 def _add_rect(sk, w, h, cx, cy):
     hw, hh = w / 2.0, h / 2.0
     pts = [App.Vector(cx - hw, cy - hh, 0), App.Vector(cx + hw, cy - hh, 0),
@@ -204,10 +214,11 @@ def build(spec, out_path):
                 ctr = App.Vector(mr * math.cos(math.radians(a)), mr * math.sin(math.radians(a)), zc)
                 cyl.Placement = App.Placement(ctr - axis * (L / 2.0), rot)
                 tip = cyl
-        elif kind == "prism_cut":
+        elif kind in ("prism_cut", "prism_pad"):
             # A placed profile-along-an-axis cut: a datum plane at {origin, xdir, normal}, a sketch of
             # the polys on it, and a Pocket of `depth` along +normal (Reversed, since a PartDesign
             # Pocket cuts opposite the sketch normal by default). Mirrors b3d_emit's prism_cut.
+            # prism_pad is the same construction as a Pad, which already extrudes along +normal.
             ox = App.Vector(*f["origin"])
             zx = App.Vector(*f["normal"]); zx.normalize()
             xx = App.Vector(*f["xdir"]); xx.normalize()
@@ -229,13 +240,25 @@ def build(spec, out_path):
                 polys = [_sample_arcs(p) for p in polys]
             for poly in polys:
                 _add_poly(sk, poly)
-            p = body.newObject("PartDesign::Pocket", f["name"])
+            p = body.newObject("PartDesign::Pad" if kind == "prism_pad" else "PartDesign::Pocket",
+                               f["name"])
             p.Label = f["name"]
             p.Profile = sk
             p.Length = f["depth"]
-            p.Reversed = True                       # cut along +normal (the datum's Z)
+            p.Reversed = kind == "prism_cut"        # a Pocket cuts opposite the datum's Z; a Pad pads along it
             if f.get("taper"):
-                p.TaperAngle = FC_PRISM_TAPER_SIGN * f["taper"]
+                p.TaperAngle = (FC_TAPER_SIGN if kind == "prism_pad" else FC_PRISM_TAPER_SIGN) * f["taper"]
+                # same back-off as b3d_emit: the drafted offset of a concave traced profile can
+                # self-intersect and the kernel refuse — the cut matters more than its draft
+                doc.recompute()
+                while _broken(p):
+                    a = float(getattr(p.TaperAngle, "Value", p.TaperAngle))
+                    if abs(a) < 5.0:
+                        p.TaperAngle = 0.0
+                        doc.recompute()
+                        break
+                    p.TaperAngle = round(a / 2.0, 1)
+                    doc.recompute()
             tip = p
         else:
             raise ValueError(f"unknown feature kind: {kind}")

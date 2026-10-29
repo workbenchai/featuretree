@@ -203,6 +203,38 @@ def measure(mesh, dz=0.25, min_height=1.0):
     return {"extents": [round(float(v), 2) for v in mesh.extents], "slice_spacing": dz, "levels": levels}
 
 
+def _floor_outline(field, level, cols, zs, nth, rm, tol_mm=0.35):
+    """The patch floor's measured boundary: the `level` contour of its |residual| field, as
+    [[theta_deg, z], ...] simplified to `tol_mm` (measured in arc mm at the body radius `rm`).
+    The columns are rolled so a seam-crossing patch is contiguous before tracing; a contour
+    that degenerates (under 4 points once simplified) returns None and the caller keeps its
+    rectangle."""
+    from skimage import measure as skm
+    from shapely.geometry import Polygon
+    bins = np.unique(cols)
+    gaps = np.diff(np.concatenate([bins, [bins[0] + nth]]))
+    start = int(bins[(int(np.argmax(gaps)) + 1) % len(bins)])
+    rolled = np.pad(np.roll(field, -start, axis=1), 1)
+    best = None
+    for c in skm.find_contours(rolled, level):
+        if len(c) < 4 or np.any(c[0] != c[-1]):
+            continue
+        area = 0.5 * abs(np.dot(c[:-1, 0], c[1:, 1]) - np.dot(c[1:, 0], c[:-1, 1]))
+        if best is None or area > best[0]:
+            best = (area, c)
+    if best is None:
+        return None
+    c = best[1]
+    th = (c[:, 1] - 1 + start + 0.5) * 360.0 / nth          # grid col -> degrees
+    z = np.interp(c[:, 0] - 1, np.arange(len(zs)), zs)      # grid row -> mm
+    poly = Polygon(np.column_stack([np.radians(th) * rm, z]))  # simplify in arc mm
+    poly = poly.buffer(0).simplify(tol_mm)
+    if poly.is_empty or poly.geom_type != "Polygon" or len(poly.exterior.coords) < 5:
+        return None
+    pts = np.asarray(poly.exterior.coords)[:-1]
+    return [[round(float(np.degrees(u / rm)), 2), round(float(v), 2)] for u, v in pts]
+
+
 def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
     """What the outline carries AROUND the axis that the stepped levels cannot say: the radius
     binned every 360/`nth` degrees at every `dz` of height, minus each slice's own median (the
@@ -211,7 +243,8 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
     (an inset switch well, a grip panel, a moulded pad) — with its z span, centre angle and
     angular span, depth (the deep decile, so a soft rim does not dilute a flat floor), mean body
     radius there, arc width, area, and `fill` (how much of its bounding box it covers: 1.0 is a
-    clean rectangle). A full "ring_rib" / "ring_groove" is axisymmetric and so invisible to the
+    clean rectangle). A patch also carries the traced `outline` of its floor (the 0.6 x depth
+    contour, as [theta_deg, z] points) so tree() can cut the measured shape, not a rectangle. A full "ring_rib" / "ring_groove" is axisymmetric and so invisible to the
     residual; those are read off the baseline instead, as a bump or dip in base(z) that returns
     to the surrounding radius (which a step shoulder does not).
     Angles are about the mean slice centroid (`axis_xy`); `noise` is the median |residual|."""
@@ -293,6 +326,8 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
             deep = np.abs(vals) >= 0.6 * depth                 # the floor, past the walls' ramp
             _, fspan, fcentre = _ang(cols[deep])
             frows = rows[deep]
+            outline = _floor_outline(np.where(lab == L, np.abs(r0), 0.0), 0.6 * depth,
+                                     cols, zs, nth, rm)
             patches.append({"kind": ("ring_groove" if kind == "recess" else "ring_rib")
                             if nbins >= 0.97 * nth else kind,
                             "z": [round(float(zs[rows.min()] - dz / 2), 2),
@@ -304,7 +339,8 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
                             "floor": {"z": [round(float(zs[frows.min()] - dz / 2), 2),
                                             round(float(zs[frows.max()] + dz / 2), 2)],
                                       "theta_deg": [round(float(fcentre), 1),
-                                                    round(fspan * 360.0 / nth, 1)]}})
+                                                    round(fspan * 360.0 / nth, 1)]},
+                            **({"outline": outline} if outline else {})})
     patches.sort(key=lambda p: -p["area_mm2"])
     return {"axis_xy": [round(float(ax[0]), 2), round(float(ax[1]), 2)], "dz": dz, "tol": tol,
             "noise": round(float(np.nanmedian(np.abs(res[valid]))), 3), "patches": patches}
@@ -315,6 +351,86 @@ def _snap(v, grid=0.5, within=0.3):
     is within `within` of it, else the measurement to 0.01."""
     g = round(v / grid) * grid
     return round(g, 6) if abs(g - v) <= within else round(v, 2)
+
+
+def _panel_outline_union(bands, ang, rm, zmid, fuse=2.0, tol_mm=0.35):
+    """The panel floor (or a boss's plateau) as the scan measured it, UNWRAPPED: each band's
+    traced outline laid out in (arc mm about the panel's centre angle, z), the texture gaps
+    between bands closed morphologically (buffer out and back by `fuse`), simplified. One
+    shapely Polygon in that cylinder space — or None (any band without an outline, or a
+    degenerate union), which keeps the rectangle."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    polys = []
+    for b in bands:
+        o = b.get("outline")
+        if not o or len(o) < 3:
+            return None
+        p = Polygon([(math.radians((th - ang + 180) % 360 - 180) * rm, z - zmid)
+                     for th, z in o]).buffer(0)
+        if p.is_empty:
+            return None
+        polys.append(p)
+    u = unary_union(polys).buffer(fuse).buffer(-fuse).simplify(tol_mm)
+    if u.geom_type == "MultiPolygon":
+        u = max(u.geoms, key=lambda q: q.area)
+    if u.is_empty or u.geom_type != "Polygon" or len(u.exterior.coords) < 5:
+        return None
+    return u
+
+
+def _chord_poly(upoly, rm, rf, mirror):
+    """A cylinder-space polygon mapped onto its facet's tangent plane as chords at radius `rf`.
+    `mirror` flips u for a plane whose xdir runs against theta (a boss's inward-facing frame).
+    Micro-edges are dropped: clipping a strip near an outline vertex leaves slivers of a tenth
+    of a millimetre, and the strict kernels refuse tools that carry them."""
+    rf = max(rf, 1.0)
+    pts = [((-1 if mirror else 1) * rf * math.sin(s / rm), v)
+           for s, v in upoly.exterior.coords[:-1]]
+    if sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1])) < 0:
+        pts.reverse()                                        # the profile loop stays CCW
+    kept = []
+    for p in pts:
+        if not kept or math.dist(p, kept[-1]) >= 0.25:
+            kept.append(p)
+    if len(kept) > 2 and math.dist(kept[0], kept[-1]) < 0.25:
+        kept.pop()
+    return [(round(x, 3), round(y, 3), 0) for x, y in (kept if len(kept) >= 3 else pts)]
+
+
+def _facets(upoly, ang, rm, width_deg=30.0, overlap=1.0):
+    """A wide cylinder-space polygon split into chord-sized facets: (centre angle, polygon
+    recentred on it) per piece, each narrow enough for a flat tangent panel to stay honest.
+    Adjacent strips overlap well past flushness so their booleans cross transversally."""
+    from shapely import affinity
+    from shapely.geometry import box
+    s0, v0, s1, v1 = upoly.bounds
+    W = rm * math.radians(width_deg)
+    n = max(1, int(math.ceil((s1 - s0) / W)))
+    out = []
+    for j in range(n):
+        clip = upoly.intersection(box(s0 + j * W - overlap, v0 - 1.0,
+                                      s0 + (j + 1) * W + overlap, v1 + 1.0))
+        for piece in (clip.geoms if clip.geom_type == "MultiPolygon" else [clip]):
+            if piece.geom_type != "Polygon" or piece.area < 2.0 or len(piece.exterior.coords) < 4:
+                continue
+            smid = (piece.bounds[0] + piece.bounds[2]) / 2
+            # neighbouring facets carry near-coincident walls through the overlap strips (same
+            # source outline, and v maps straight to world Z), and a kernel merges anything
+            # within its tolerance into the flush boolean it refuses. Alternating facets
+            # breathe 0.15 mm in and out, so every such wall pair ends up a real 0.3 mm apart
+            # — honest geometry to the kernel, invisible against scan noise.
+            b = piece.bounds
+            eps = 0.15 if j % 2 == 0 else -0.15
+            piece = affinity.scale(piece,
+                                   xfact=1.0 + eps / max((b[2] - b[0]) / 2, 1.0),
+                                   yfact=1.0 + eps / max((b[3] - b[1]) / 2, 1.0), origin="center")
+            out.append((ang + math.degrees(smid / rm),
+                        affinity.translate(piece, xoff=-smid)))
+    # last strip first: a terminus facet (the wrap's rounded end) cuts cleanly into virgin
+    # material, but SolidCraft's checker refuses any LATER facet that cuts beside its void —
+    # found empirically (every order ending with the first strip passes, no other does)
+    return out[::-1]
 
 
 def tree(measured, snap=True):
@@ -460,13 +576,124 @@ def tree(measured, snap=True):
 
     pats = (measured.get("relief") or {}).get("patches", [])
     for p in pats:
-        if p["kind"] != "recess":
+        if p["kind"] not in ("recess", "boss"):
             notes.append(f"{p['kind'].replace('_', ' ')} z {p['z'][0]}..{p['z'][1]} at "
                          f"{p['theta_deg'][0]} deg ({p['theta_deg'][1]} deg wide), {p['depth']} mm: "
                          f"seen but not modelled")
-    panels = []        # one moulded panel often scans as bands between the ribs that cross it
-    for p in sorted((p for p in pats if p["kind"] == "recess"), key=lambda p: p["z"][0]):
-        for g in panels:
+    for pkind, sgn, fname in (("recess", -1, "inset"), ("boss", 1, "boss")):
+        _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes)
+    breaks = _coalesce_patterns(breaks, notes)
+    return IR.part("part", *feats, *breaks), notes
+
+
+def _coalesce_patterns(feats, notes):
+    """Repeated relief features recognised as the PATTERNS a designer drew: features of one kind
+    whose size, depth and radius agree, standing at evenly spaced angles (a polar ring — count 2
+    only when opposite) or evenly spaced heights on one angle (a stack), collapse to their first
+    instance plus one ir.pattern. The master's traced shape stands for every instance: a moulded
+    pattern IS even and identical, and the per-instance differences are scan noise."""
+    import ir as IR
+
+    def _p(f):
+        o = f["origin"]
+        pts = f["polys"][0]
+        us, vs = [p[0] for p in pts], [p[1] for p in pts]
+        return {"f": f, "kind": f["kind"], "r": math.hypot(o[0], o[1]),
+                "th": math.degrees(math.atan2(o[1], o[0])) % 360, "z": o[2],
+                "depth": f["depth"], "taper": f.get("taper", 0.0),
+                "w": max(us) - min(us), "h": max(vs) - min(vs)}
+
+    def _alike(a, b, same_z):
+        # neither taper nor depth is compared tightly: both are the noisiest measurements made
+        # here (a shadowed instance scans shallow), and a pattern unifies its members on the
+        # median of each instead
+        return (a["kind"] == b["kind"]
+                and abs(a["depth"] - b["depth"]) <= max(0.8, 0.45 * max(a["depth"], b["depth"]))
+                and abs(a["r"] - b["r"]) <= 0.8
+                and abs(a["w"] - b["w"]) <= 0.35 * max(a["w"], b["w"])
+                and abs(a["h"] - b["h"]) <= 0.35 * max(a["h"], b["h"])
+                and (abs(a["z"] - b["z"]) <= 1.0 if same_z
+                     else abs((a["th"] - b["th"] + 180) % 360 - 180) <= 7.0))
+
+    def _unify(master, group):
+        ts = sorted(d["taper"] for d in group)
+        t = round(ts[len(ts) // 2], 1)
+        if t:
+            master["f"]["taper"] = t
+        else:
+            master["f"].pop("taper", None)
+        ds = sorted(d["depth"] for d in group)
+        master["f"]["depth"] = round(ds[len(ds) // 2], 2)
+
+    cand = [_p(f) for f in feats                      # facets (name_1, name_2 ...) stay out:
+            if f["kind"] in ("prism_cut", "prism_pad") and "_" not in f["name"]]
+    used, plans = set(), {}                       # master name -> (pattern feature, member names)
+    for c in cand:                                # polar rings first: same z, even angles
+        if c["f"]["name"] in used:
+            continue
+        ring = [c] + [d for d in cand if d is not c and d["f"]["name"] not in used
+                      and _alike(c, d, same_z=True)]
+        if len(ring) >= 2:
+            ring.sort(key=lambda d: d["th"])
+            diffs = [(ring[(i + 1) % len(ring)]["th"] - ring[i]["th"]) % 360
+                     for i in range(len(ring))]
+            step = 360.0 / len(ring)
+            even = all(abs(d - step) <= 7.0 for d in diffs)
+            if even and (len(ring) >= 3 or abs(step - 180.0) <= 7.0):
+                names = [d["f"]["name"] for d in ring]
+                used.update(names)
+                _unify(c, ring)
+                plans[c["f"]["name"]] = (IR.pattern(f"{c['f']['name']}_ring", c["f"]["name"],
+                                                    len(ring), angle_step=round(step, 2)), names)
+                notes.append(f"pattern: {' / '.join(names)} are one {len(ring)} x polar ring "
+                             f"every {round(step, 1)} deg; drawn once as {c['f']['name']}")
+    for c in cand:                                # stacks: same angle, even z steps
+        if c["f"]["name"] in used:
+            continue
+        col = sorted([c] + [d for d in cand if d is not c and d["f"]["name"] not in used
+                            and _alike(c, d, same_z=False)], key=lambda d: d["z"])
+        if len(col) >= 3:
+            dz = [b["z"] - a["z"] for a, b in zip(col, col[1:])]
+            step = sorted(dz)[len(dz) // 2]
+            if all(abs(d - step) <= 0.75 for d in dz) and step > 0.5:
+                base = col[0]
+                names = [d["f"]["name"] for d in col]
+                used.update(names)
+                _unify(base, col)
+                plans[base["f"]["name"]] = (IR.pattern(f"{base['f']['name']}_stack",
+                                                       base["f"]["name"], len(col),
+                                                       z_step=round(step, 2)), names)
+                notes.append(f"pattern: {' / '.join(names)} are one {len(col)} x stack every "
+                             f"{round(step, 2)} mm; drawn once as {base['f']['name']}")
+    if not plans:
+        return feats
+    masters = {m: p for m, (p, names) in plans.items()}
+    members = {n for _, names in plans.values() for n in names} - set(masters)
+    out = []
+    for f in feats:
+        if f.get("name") in members:
+            continue
+        out.append(f)
+        if f.get("name") in masters:
+            out.append(masters[f["name"]])
+    return out
+
+
+def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes):
+    """The relief patches of one sign as placed features: recesses (sgn -1) become drafted
+    prism_cuts into the body, bosses (sgn +1) become drafted prism_pads standing proud of it —
+    the same construction mirrored through the surface. Recess bands within 15 degrees and 4 mm
+    merge into one panel (one moulded panel scans as bands between the ribs that cross it);
+    boss patches stay separate, because neighbouring ribs really are separate features."""
+    import ir as IR
+    # where measure() had to bridge a blank (no closed slices), the scanner was failing —
+    # torn chrome, deep gloss. Relief data above the LAST such band mixes outer and inner
+    # walls of torn slices into fictional recesses and bosses, so none of it is modelled.
+    gaps = [a["z"][1] for a, b in zip(levels, levels[1:]) if b["z"][0] - a["z"][1] > 1.0]
+    torn_above = gaps[-1] if gaps else None
+    panels = []
+    for p in sorted((p for p in pats if p["kind"] == pkind), key=lambda p: p["z"][0]):
+        for g in (panels if pkind == "recess" else []):
             if abs((g["theta"] - p["theta_deg"][0] + 180) % 360 - 180) <= 15 \
                     and abs(g["rm"] - p["mean_radius"]) <= 1.5 and p["z"][0] - g["z"][1] <= 4.0:
                 g["bands"].append(p)
@@ -491,14 +718,25 @@ def tree(measured, snap=True):
         fill = max(b["fill"] for b in bands)
         where = f"z {g['z'][0]}..{g['z'][1]} at {round(ang, 1)} deg ({g['span']} deg wide)" \
             + (f", {len(bands)} scan bands" if len(bands) > 1 else "")
-        if fill < 0.6 or t < 0.3 or g["span"] > 120:
-            notes.append(f"recess {where}, {t} mm deep (fill {fill}): "
-                         f"seen but not rectangular enough to model")
+        upoly = _panel_outline_union(bands, ang, rm, (g["z"][0] + g["z"][1]) / 2,
+                                     fuse=2.0 if pkind == "recess" else 0.75)
+        # a recess's flat floor is the mould insert itself, so a chord panel holds to 120 deg;
+        # a boss's plateau FOLLOWS the body's curve, and a flat pad stands proud of it at the
+        # edges by chord sag — honest only while narrow. A wider TRACED feature still lands,
+        # as a fan of chord facets, each in its own tangent frame, following the wrap.
+        if torn_above is not None and (g["z"][0] + g["z"][1]) / 2 > torn_above:
+            notes.append(f"{pkind} {where}: above the scan's last torn band (z > {torn_above}), "
+                         f"where slice data is unreliable; left out")
+            continue
+        single_max = 120 if sgn < 0 else 60
+        if t < 0.3 or g["span"] > 355 or (upoly is None and (g["span"] > single_max or fill < 0.6)):
+            notes.append(f"{pkind} {where}, {t} mm {'deep' if sgn < 0 else 'proud'} (fill {fill}): "
+                         f"seen but too shallow, too wrapped, or too shapeless to model")
             continue
         if t_raw > 1.5 * (g["fz"][1] - g["fz"][0]):        # deeper than tall: a dome or shoulder
-            notes.append(f"recess {where}, {t} mm deep but only "
+            notes.append(f"{pkind} {where}, {t} mm {'deep' if sgn < 0 else 'proud'} but only "
                          f"{round(g['fz'][1] - g['fz'][0], 2)} mm tall: a curved end face seen "
-                         f"edge-on, not a moulded recess; left out")
+                         f"edge-on, not a moulded feature; left out")
             continue
         # the walls' draft, from the two contours the patch measured: its outline sits where the
         # residual crosses -tol (near the mouth), its floor where it passes 0.6 x depth — the run
@@ -506,9 +744,9 @@ def tree(measured, snap=True):
         # contour's own radius, and a resolution slop (half an angular bin + a quarter slice) is
         # taken off the run so a vertical wall does not read as drafted.
         rel = measured["relief"]
-        w = 2 * (rm - rel.get("tol", 0.3)) * math.sin(math.radians(g["span"]) / 2)
+        w = 2 * (rm + sgn * rel.get("tol", 0.3)) * math.sin(math.radians(g["span"]) / 2)
         h = g["z"][1] - g["z"][0]
-        wf = min(2 * (rm - 0.8 * t_raw) * math.sin(math.radians(g["fspan"]) / 2), w)
+        wf = min(2 * (rm + sgn * 0.8 * t_raw) * math.sin(math.radians(g["fspan"]) / 2), w)
         hf = min(g["fz"][1] - g["fz"][0], h)
         if wf < 1.5 or hf < 1.0:
             wf, hf = w, h
@@ -521,21 +759,58 @@ def tree(measured, snap=True):
         B = -0.41421356       # tan(90/4), negative: on a CCW loop the convex corner bows RIGHT
         # of travel, and _geom's positive bulge bows left (found by SolidCraft's taper check —
         # the other kernels silently built the concave corners)
-        poly = [(-wf / 2 + rc, -hf / 2, 0), (wf / 2 - rc, -hf / 2, B), (wf / 2, -hf / 2 + rc, 0),
+        rect = [(-wf / 2 + rc, -hf / 2, 0), (wf / 2 - rc, -hf / 2, B), (wf / 2, -hf / 2 + rc, 0),
                 (wf / 2, hf / 2 - rc, B), (wf / 2 - rc, hf / 2, 0), (-wf / 2 + rc, hf / 2, B),
                 (-wf / 2, hf / 2 - rc, 0), (-wf / 2, -hf / 2 + rc, B)]
-        phi = math.radians(ang)
-        sag = rm - math.sqrt(max(rm * rm - (max(w, wf) / 2) ** 2, 0.0))
+        if upoly is None:
+            pieces = [(ang, None)]
+        elif g["span"] > single_max:
+            # facet side walls must mate exactly where the strips meet, so the facets of a
+            # wrap carry no draft: a taper would swell every strip into its neighbours
+            pieces, taper = _facets(upoly, ang, rm), 0.0
+        else:
+            taper = max(taper, -45.0)      # a traced contour is concave: keep its offset sane
+            pieces = [(ang, upoly)]
+        if not pieces:
+            continue
+        rf = rm + sgn * 0.8 * t_raw
+        make = IR.prism_cut if pkind == "recess" else IR.prism_pad
         zc = (g["z"][0] + g["z"][1]) / 2 - levels[0]["z"][0]
-        breaks.append(IR.prism_cut(f"inset{k + 1}",
-                                   origin=[(rm - t) * math.cos(phi), (rm - t) * math.sin(phi), zc],
-                                   normal=[math.cos(phi), math.sin(phi), 0.0],
-                                   xdir=[-math.sin(phi), math.cos(phi), 0.0],
-                                   depth=round(t + sag + 1.0, 2), polys=[poly], taper=taper))
-        notes.append(f"inset{k + 1}: recess {where} modelled as a moulded cut: {wf} x {hf} mm "
-                     f"floor, {t} mm deep, walls drafted {abs(taper)} deg, corners r {rc}"
+        # a panel that spans body steps sits at its AVERAGE radius: a cut must still punch out
+        # through the fattest step it crosses, and a pad must still root inside the thinnest,
+        # or the boolean meets the surface face-on-face and the kernel refuses it
+        rr = [lv["outer_diameter"] / 2 for lv in levels
+              if lv["z"][1] > g["z"][0] and lv["z"][0] < g["z"][1]]
+        over = 0.0 if not rr else (max(max(rr) - rm, 0.0) if sgn < 0 else max(rm - min(rr), 0.0))
+        for j, (ang_j, pc) in enumerate(pieces):
+            poly = rect if pc is None else _chord_poly(pc, rm, rf, sgn > 0)
+            phi = math.radians(ang_j)
+            half_w = max(max(abs(p[0]) for p in poly), w / 2 if len(pieces) == 1 else 0.0)
+            sag = rm - math.sqrt(max(rm * rm - min(half_w, rm) ** 2, 0.0))
+            # a facet's flat face straddles the curve it stands for: sunk by half its own chord
+            # sag, it errs evenly in and out instead of all to one side. A single moulded floor
+            # really is flat (the mould insert), so a lone recess panel keeps its plane.
+            uf = min(max(abs(p[0]) for p in poly), rm)
+            rp = rm + sgn * t
+            straddle = 0.0 if (sgn < 0 and len(pieces) == 1) \
+                else (rp - math.sqrt(max(rp * rp - uf * uf, 0.0))) / 2
+            # the frame faces the body: a recess cuts outward from under the floor, a boss pads
+            # inward from above its plateau — either way the extrusion crosses the surface and
+            # the profile grows (negative taper) toward it. xdir keeps v = normal x xdir = +Z.
+            r0 = rp - straddle
+            breaks.append(make(f"{fname}{k + 1}" + (f"_{j + 1}" if len(pieces) > 1 else ""),
+                               origin=[r0 * math.cos(phi), r0 * math.sin(phi), zc],
+                               normal=[-sgn * math.cos(phi), -sgn * math.sin(phi), 0.0],
+                               xdir=[sgn * math.sin(phi), -sgn * math.cos(phi), 0.0],
+                               depth=round(t + sag + 1.0 + straddle + over, 2),
+                               polys=[poly], taper=taper))
+        shape_note = (f"{wf} x {hf} mm floor, corners r {rc}" if upoly is None
+                      else f"{'floor' if sgn < 0 else 'plateau'} outline traced from the scan"
+                      + (f", wrapped as {len(pieces)} chord facets" if len(pieces) > 1 else ""))
+        notes.append(f"{fname}{k + 1}: {pkind} {where} modelled as a moulded "
+                     f"{'cut' if sgn < 0 else 'pad'}: {shape_note}, {t} mm "
+                     f"{'deep' if sgn < 0 else 'proud'}, walls drafted {abs(taper)} deg"
                      + (" (texture crossing the panel is cut away)" if len(bands) > 1 else ""))
-    return IR.part("part", *feats, *breaks), notes
 
 
 def spec_mesh(spec):

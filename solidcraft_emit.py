@@ -23,7 +23,7 @@ Conventions pinned by tests/test_solidcraft_emit.py (live, when the CLI is insta
 
 Coverage: sketches (circles / rects / polygons with bulge arcs) on XY, XZ or a top/bottom face;
 pad (blind, symmetric, taper), pocket (through / blind, taper), revolve about Z, fillet and
-chamfer from edges_of picks, prism_cut on any plane, polar_pocket. Not yet: fillet / chamfer by
+chamfer from edges_of picks, prism_cut / prism_pad on any plane, polar_pocket. Not yet: fillet / chamfer by
 {"circles"} query — that selector is resolved against live geometry, which a one-way script
 cannot ask for (raises NotImplementedError).
 """
@@ -190,10 +190,10 @@ class Emitter:
             kw["body_name"] = self.part
         self.add("solid.revolve", **kw)
 
-    def _placed_cut(self, name, fr, loops, depth, taper=0.0):
+    def _placed_cut(self, name, fr, loops, depth, taper=0.0, operation="cut"):
         self.sketch_cmds(name + "_sk", fr, loops)
         kw = {"sketch": name + "_sk", "distance": _mm(depth), "direction": "positive",
-              "operation": "cut", "name": name}
+              "operation": operation, "name": name}
         if taper:
             kw["taper"] = _deg(-taper)
         self.add("solid.extrude", **kw)
@@ -201,6 +201,11 @@ class Emitter:
     def f_prism_cut(self, f):
         fr = G.frame(f["origin"], f["normal"], f["xdir"])
         self._placed_cut(f["name"], fr, G.sketch_loops(polys=f["polys"]), f["depth"], f.get("taper", 0.0))
+
+    def f_prism_pad(self, f):
+        fr = G.frame(f["origin"], f["normal"], f["xdir"])
+        self._placed_cut(f["name"], fr, G.sketch_loops(polys=f["polys"]), f["depth"],
+                         f.get("taper", 0.0), operation="join")
 
     def f_polar_pocket(self, f):
         for i, (fr, loops, depth) in enumerate(G.polar_cuts(f)):
