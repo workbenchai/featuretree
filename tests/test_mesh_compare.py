@@ -213,6 +213,30 @@ def test_carved_line_detailing_comes_back_and_cuts_again():
     assert rebuilt == pytest.approx(mesh.volume, rel=0.01)
 
 
+def test_a_grip_washboard_comes_back_as_one_ridge_pattern():
+    ridge = [(t, 8.0) for t in range(120, 241, 6)]          # a 120-degree ring segment at z 8
+    src = IR.part(
+        "gripped",
+        IR.sketch("s", circles=[(0, 0, 15)]),
+        IR.pad("p", "s", 60),
+        IR.engrave("r1", ridge, width=1.0, depth=0.8, radius=15.0, side="emboss", build=True),
+        IR.pattern("r1_stack", "r1", count=22, z_step=2.0),  # ridges z 8..50
+    )
+    mesh = MC.spec_mesh(src)
+    m = MC.measure(mesh)
+    m["relief"] = MC.relief(mesh)
+    made, notes = MC.tree(m)
+    wb = [f for f in made["features"] if f["kind"] == "engrave" and f["name"].startswith("washboard")]
+    st = [f for f in made["features"] if f["kind"] == "pattern" and "z_step" in f]
+    assert wb and st                                        # one ridge, one stack: the pattern it is
+    assert st[0]["z_step"] == pytest.approx(2.0, abs=0.3)
+    assert st[0]["count"] >= 18
+    assert wb[0]["depth"] == pytest.approx(0.8, abs=0.25)   # crest above the valley baseline
+    assert any("washboard" in n for n in notes)
+    assert not IR.validate(made)
+    assert MC.compare(made, mesh)["iou_pct"] > 98   # texture recovery: sector edges may trim
+
+
 def test_a_ring_of_bosses_comes_back_as_one_pattern():
     spec = IR.part(
         "ringed",

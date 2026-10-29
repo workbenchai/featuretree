@@ -312,6 +312,80 @@ def _detail_lines(res, zs, nth, base, tol, min_len=8.0, max_width=3.0):
     return out
 
 
+def _washboard(res, zs, nth, base, dz):
+    """Periodic grip texture — circumferential micro-ridges stacked along Z — read as THE
+    PATTERN IT IS: per theta column, the longest band of sustained residual is autocorrelated
+    along z; columns agreeing on a pitch cluster into sectors, and each sector folds all its
+    repeats into one measured ridge (pitch, height, phase). One ridge plus one pattern then
+    stands for the whole washboard."""
+    from scipy import ndimage as ndi
+    # the ridges are circumferential, so a few degrees of theta-smoothing averages them
+    # IN PHASE: amplitude survives, scan noise drops by root-N, and the per-column
+    # autocorrelation becomes the statistic it pretends to be
+    res = ndi.uniform_filter1d(res, size=max(3, nth // 72), axis=1, mode="wrap")
+    cols = {}
+    for c in range(nth):
+        v = res[:, c]
+        act = np.convolve(np.abs(v), np.ones(9) / 9, mode="same") > 0.25
+        runs, i = [], 0
+        while i < len(act):
+            if act[i]:
+                j = i
+                while j < len(act) and act[j]:
+                    j += 1
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        if not runs:
+            continue
+        i0, i1 = max(runs, key=lambda r: r[1] - r[0])
+        if (i1 - i0) * dz < 12.0:
+            continue
+        x = v[i0:i1] - v[i0:i1].mean()
+        denom = float(x @ x)
+        if denom < 1e-9:
+            continue
+        best = None
+        for lag in range(3, min(int(6.0 / dz) + 1, (i1 - i0) // 3)):
+            a = float(x[:-lag] @ x[lag:]) / denom
+            if best is None or a > best[1]:
+                best = (lag, a)
+        if best and best[1] > 0.3:
+            cols[c] = (best[0], i0, i1)
+    if not cols:
+        return []
+    sectors, run = [], []
+    for c in list(range(nth)) + [None]:         # wrapped runs of agreeing columns
+        ok = c is not None and (c in cols or (run and c - 1 in cols and (c + 1) % nth in cols))
+        if ok:
+            run.append(c)
+            continue
+        if run and len(run) >= nth // 45:       # at least 8 degrees wide
+            lags = [cols[c][0] for c in run if c in cols]
+            lag = sorted(lags)[len(lags) // 2]
+            i0 = int(np.median([cols[c][1] for c in run if c in cols]))
+            i1 = int(np.median([cols[c][2] for c in run if c in cols]))
+            prof = np.nanmean(res[i0:i1, run], axis=1)
+            n = (len(prof) // lag) * lag
+            if n >= 2 * lag:
+                fold = prof[:n].reshape(-1, lag).mean(axis=0)
+                height = float(fold.max() - fold.min())
+                if height >= 0.35:
+                    centre = ((run[0] + (len(run) - 1) / 2) % nth + 0.5) * 360.0 / nth
+                    sectors.append({
+                        "theta_deg": [round(centre, 1), round(len(run) * 360.0 / nth, 1)],
+                        "z": [round(float(zs[i0]), 2), round(float(zs[i1 - 1]), 2)],
+                        "pitch": round(lag * dz, 2),
+                        "ridge_width": round(max(float((fold > fold.max() / 2).sum()) * dz, dz), 2),
+                        "height": round(height, 2),
+                        "crest": round(float(fold.max()), 2),
+                        "phase_z": round(float(zs[i0 + int(np.argmax(fold))]), 2),
+                        "radius": round(float(np.nanmedian(base[i0:i1])), 2)})
+        run = []
+    return sectors
+
+
 def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
     """What the outline carries AROUND the axis that the stepped levels cannot say: the radius
     binned every 360/`nth` degrees at every `dz` of height, minus each slice's own median (the
@@ -329,7 +403,23 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
     z0, z1 = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
     zs = np.arange(z0 + dz, z1 - dz / 2, dz)
     secs = slices(mesh, zs)
-    ax = np.mean([_largest(s).exterior.centroid.coords[0] for s in secs if s is not None], axis=0)
+    def _core_centre(s):
+        # the CORE circle's centre, not the outline's: a ring centroid is length-weighted, and
+        # one-sided texture (a sector of ridges) drags it by more than a millimetre, which then
+        # reads as a one-cycle wave across the whole residual field. Trim the proud points and
+        # circle-fit what remains, twice.
+        pts = np.asarray(_largest(s).exterior.segmentize(0.3).coords)
+        c = pts.mean(axis=0)
+        for _ in range(2):
+            r = np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1])
+            keep = pts[r <= np.median(r) + 0.5]
+            if len(keep) < 8:
+                break
+            A = np.c_[keep[:, 0], keep[:, 1], np.ones(len(keep))]
+            x, *_ = np.linalg.lstsq(A, (keep ** 2).sum(axis=1), rcond=None)
+            c = np.array([x[0] / 2, x[1] / 2])
+        return c
+    ax = np.median([_core_centre(s) for s in secs if s is not None], axis=0)
     R = np.full((len(zs), nth), np.nan)
     for i, s in enumerate(secs):
         if s is None:
@@ -337,7 +427,10 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
         ext = _largest(s).exterior
         pts = np.asarray(ext.segmentize(max(ext.length / (2 * nth), 0.05)).coords)
         th = np.arctan2(pts[:, 1] - ax[1], pts[:, 0] - ax[0])
-        b = (th / (2 * np.pi) * nth).astype(int) % nth
+        # floor, never truncate: astype(int) rounds toward zero, which makes the bin at 180
+        # degrees a measure-zero sliver that almost never receives a point — and an always-empty
+        # column silently split every patch, label and line that crossed the 180 meridian
+        b = np.floor(th / (2 * np.pi) * nth).astype(int) % nth
         r = np.hypot(pts[:, 0] - ax[0], pts[:, 1] - ax[1])
         sums, cnt = np.zeros(nth), np.zeros(nth)
         np.add.at(sums, b, r)
@@ -426,6 +519,7 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
             "base_z": [round(float(z), 2) for z in zs[rows_ok]],
             "base_r": [round(float(r), 3) for r in base[rows_ok]],
             "detail": _detail_lines(r0, zs, nth, base, tol),
+            "washboard": _washboard(r0, zs, nth, base, dz),
             "patches": patches}
 
 
@@ -459,6 +553,15 @@ def _panel_outline_union(bands, ang, rm, zmid, fuse=2.0, tol_mm=0.35):
         u = max(u.geoms, key=lambda q: q.area)
     if u.is_empty or u.geom_type != "Polygon" or len(u.exterior.coords) < 5:
         return None
+    # moulded corners: close then open by a radius the feature can afford, so the traced
+    # outline keeps its shape but loses the die-cut corners a simplified polygon carries
+    b = u.bounds
+    rc = min(0.6, 0.2 * min(b[2] - b[0], b[3] - b[1]))
+    if rc > 0.15:
+        rounded = u.buffer(rc).buffer(-2 * rc).buffer(rc)
+        if rounded.geom_type == "Polygon" and not rounded.is_empty \
+                and rounded.area > 0.6 * u.area:
+            u = rounded.simplify(tol_mm / 2)
     return u
 
 
@@ -501,10 +604,10 @@ def _facets(upoly, ang, rm, width_deg=30.0, overlap=1.0, reverse=False):
             # neighbouring facets carry near-coincident walls through the overlap strips (same
             # source outline, and v maps straight to world Z), and a kernel merges anything
             # within its tolerance into the flush boolean it refuses. Alternating facets
-            # breathe 0.15 mm in and out, so every such wall pair ends up a real 0.3 mm apart
+            # breathe 0.25 mm in and out, so every such wall pair ends up a real half-millimetre apart
             # — honest geometry to the kernel, invisible against scan noise.
             b = piece.bounds
-            eps = 0.15 if j % 2 == 0 else -0.15
+            eps = 0.25 if j % 2 == 0 else -0.25
             piece = affinity.scale(piece,
                                    xfact=1.0 + eps / max((b[2] - b[0]) / 2, 1.0),
                                    yfact=1.0 + eps / max((b[3] - b[1]) / 2, 1.0), origin="center")
@@ -689,6 +792,27 @@ def tree(measured, snap=True):
         feats.append(IR.pocket(name, f"{name}_profile", through=True))
 
     pats = (measured.get("relief") or {}).get("patches", [])
+    wash = (measured.get("relief") or {}).get("washboard") or []
+    if wash:
+        # a washboard sector PREEMPTS its own ridges: each ridge also segments as a little
+        # panel, and modelling both would stack the texture twice (and the panels would then
+        # shadow the pattern that explains them)
+        def _is_wash_ridge(p):
+            if p["kind"] not in ("recess", "boss"):
+                return False
+            for wb in wash:
+                dth = abs((p["theta_deg"][0] - wb["theta_deg"][0] + 180) % 360 - 180)
+                if dth <= wb["theta_deg"][1] / 2 + 5.0 \
+                        and p["z"][0] >= wb["z"][0] - wb["pitch"] \
+                        and p["z"][1] <= wb["z"][1] + wb["pitch"] \
+                        and p["z"][1] - p["z"][0] <= 1.6 * wb["pitch"] \
+                        and p["depth"] <= wb["height"] + 0.3:
+                    return True
+            return False
+        eaten = sum(1 for p in pats if _is_wash_ridge(p))
+        if eaten:
+            notes.append(f"{eaten} relief patch(es) are washboard ridges, carried by its pattern")
+            pats = [p for p in pats if not _is_wash_ridge(p)]
     for p in pats:
         if p["kind"] not in ("recess", "boss"):
             notes.append(f"{p['kind'].replace('_', ' ')} z {p['z'][0]}..{p['z'][1]} at "
@@ -697,14 +821,14 @@ def tree(measured, snap=True):
     covered = []                 # (ang, span, z0, z1) of every panel that became a feature
     for pkind, sgn, fname in (("recess", -1, "inset"), ("boss", 1, "boss")):
         _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes, covered)
+    gaps = [a["z"][1] for a, b in zip(levels, levels[1:]) if b["z"][0] - a["z"][1] > 1.0]
+    torn_above = gaps[-1] if gaps else None
+    z0f = levels[0]["z"][0]
     det = (measured.get("relief") or {}).get("detail")
     if det:
         # line detailing — carved contour lines, embossed ridges — lands as named, dimensioned
         # ENGRAVE features: reference by default (ir.engrave), so the tree carries the design
         # intent without turning every rebuild into hundreds of micro-booleans
-        gaps = [a["z"][1] for a, b in zip(levels, levels[1:]) if b["z"][0] - a["z"][1] > 1.0]
-        torn_above = gaps[-1] if gaps else None
-        z0f = levels[0]["z"][0]
         k = 0
         for side, key in (("carve", "carved"), ("emboss", "embossed")):
             kept = 0
@@ -715,8 +839,11 @@ def tree(measured, snap=True):
                 # face read edge-on writes fictional lines into the residual
                 if (torn_above is not None and zmid > torn_above) or zmid < z0f + 2.0:
                     continue
-                # a "line" thinner than the scan can resolve is an edge of something else
-                if e["width"] < 0.3:
+                # a "line" thinner than the scan can resolve is an edge of something else, and
+                # so is a ridge with width under a millimetre and no vertical substance at all
+                # (one slice tall): a seam or a shoulder rim echoing in the residual
+                zspan = max(z for _, z in e["path"]) - min(z for _, z in e["path"])
+                if e["width"] < 0.3 or (e["width"] < 1.0 and zspan < 1.0):
                     continue
                 # a line inside a modelled panel is either the panel's own wall read back out
                 # of the residual (it hugs the traced outline, at about the panel's depth —
@@ -753,6 +880,39 @@ def tree(measured, snap=True):
                 notes.append(f"{key} texture: {sh['count']} segments under 8 mm "
                              f"({sh['length_mm']} mm, {sh['area_mm2']} mm2) — a texture field, "
                              f"not modelled")
+    k = 0
+    for wb in (measured.get("relief") or {}).get("washboard") or []:
+        # the grip washboard: one measured ridge repeated along Z — the pattern it is
+        zmid = (wb["z"][0] + wb["z"][1]) / 2
+        if (torn_above is not None and zmid > torn_above) or wb["z"][0] < z0f + 2.0:
+            continue
+        count = int((wb["z"][1] - wb["phase_z"]) // wb["pitch"]) + 1
+        if count < 4:
+            continue
+        half = wb["theta_deg"][1] / 2 - 1.0
+        angs = np.arange(wb["theta_deg"][0] - half, wb["theta_deg"][0] + half + 2.0, 4.0)
+        pts = [(a % 360, z) for a in angs for z in (wb["phase_z"], zmid, wb["z"][1])]
+        from shapely.geometry import Point
+        inside = sum(1 for t_, z_ in pts
+                     if any(poly_.covers(Point(math.radians((t_ - a + 180) % 360 - 180) * prm,
+                                               z_ - zm))
+                            for a, zm, prm, pt_, poly_ in covered))
+        if inside > 0.5 * len(pts):
+            notes.append(f"washboard at {wb['theta_deg'][0]} deg mostly inside modelled panels; "
+                         f"left to them")
+            continue
+        k += 1
+        path = [(a % 360, wb["phase_z"] - z0f) for a in angs]
+        crest = max(wb.get("crest", round(wb["height"] / 2, 2)), 0.2)
+        breaks.append(IR.engrave(f"washboard{k}", path, width=wb["ridge_width"],
+                                 depth=crest, side="emboss",
+                                 radius=wb["radius"], build=True))
+        breaks.append(IR.pattern(f"washboard{k}_stack", f"washboard{k}", count,
+                                 z_step=wb["pitch"]))
+        notes.append(f"washboard{k}: grip ridges at {wb['theta_deg'][0]} deg "
+                     f"({wb['theta_deg'][1]} deg wide), one {wb['ridge_width']} mm ridge "
+                     f"standing {crest} mm proud, repeated "
+                     f"{count} x every {wb['pitch']} mm (z {wb['z'][0]}..{wb['z'][1]})")
     breaks = _coalesce_patterns(breaks, notes)
     return IR.part("part", *feats, *breaks), notes
 

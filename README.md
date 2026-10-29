@@ -340,6 +340,10 @@ the baseline curve rides along for tree().
 - Evenly spaced look-alikes collapse into one master + `ir.pattern` — four thumb pads come back
   as *one* boss repeated 4 × 90°, unified on the median depth and draft (the two noisiest
   estimates).
+- A grip **washboard** — periodic ridges stacked along Z — comes back as the pattern it is: one
+  measured ridge (`engrave`) repeated by one `pattern` with a count and a z-step, preempting the
+  per-ridge patches it explains. Texture that is real to the touch but not phase-coherent at
+  scan resolution (a worn diamond knurl) is *characterized* in the notes, never invented.
 - Line detailing — carved contour lines, embossed ridges, logo-style line art — is skeletonized
   out of the residual into **`engrave` features**, each a named path with one measured width and
   depth, built as real cuts and ridges. A line that merely traces a modelled panel's outline at

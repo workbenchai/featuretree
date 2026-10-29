@@ -73,7 +73,8 @@ def test_solidcraft_builds_what_build123d_builds(tmp_path):
     spec = _bushing(IR.chamfer("rim", 2, {"edges_of": "boss", "side": "top"}))
     script = tmp_path / "bushing.sc.json"
     script.write_text(json.dumps({"commands": SC.emit(spec)}))
-    stl = SC.run_script(script, tmp_path / "bushing.stl")
+    stl, dropped = SC.run_script(script, tmp_path / "bushing.stl")
+    assert not dropped                       # a clean build needs no resilience
     v = float(trimesh.load(str(stl)).volume)
     ref = b3d_emit.emit(spec)[1]["volume"]
     assert abs(v - ref) / ref < 0.005

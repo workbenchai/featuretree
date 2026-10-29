@@ -250,13 +250,46 @@ def emit(spec):
     return Emitter(spec["name"]).build(spec)
 
 
-def run_script(script_path, out_path):
-    """Run the script with solidcraft-cli, exporting `out_path` (format from its extension)."""
-    r = subprocess.run([cli_path(), "run", str(script_path), "--out", str(out_path), "--quiet"],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"solidcraft-cli failed:\n{r.stdout}\n{r.stderr}")
-    return out_path
+def run_script(script_path, out_path, save=None, max_drops=8):
+    """Run the script with solidcraft-cli, exporting `out_path` (format from its extension) and
+    optionally saving a design file. RESILIENT: SolidCraft's boolean checker refuses a tool
+    wherever it grazes other geometry within its merge tolerance, and which marginal facet
+    trips it reshuffles with every re-measure — so when it names a failing extrude, that one
+    feature (and its sketch) is dropped from the script, LOUDLY, and the run retried, up to
+    `max_drops` times. Returns (out_path, [dropped feature names]); the caller must leave the
+    same features out of any reference it verifies against."""
+    import re
+    dropped = []
+    for _ in range(max_drops + 1):
+        cmd = [cli_path(), "run", str(script_path), "--out", str(out_path), "--quiet"]
+        if save:
+            cmd += ["--save", str(save)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            return out_path, dropped
+        err = (r.stderr or "") + (r.stdout or "")
+        m = re.search(r"step (\d+)", err)
+        doc = json.loads(Path(script_path).read_text())
+        cmds = doc["commands"]
+        i = int(m.group(1)) - 1 if m else -1
+        if not m or not (0 <= i < len(cmds)) or cmds[i]["command"] != "solid.extrude":
+            raise RuntimeError(f"solidcraft-cli failed:\n{err}")
+        sk = cmds[i]["params"].get("sketch", "")
+        name = cmds[i]["params"].get("name") or sk.replace("_sk", "")
+        kill = {i}
+        for j, c in enumerate(cmds):
+            if c["command"] == "sketch.create" and c["params"].get("name") == sk:
+                k = j
+                while k < len(cmds) and not (cmds[k]["command"] == "sketch.finish" and k > j):
+                    kill.add(k)
+                    k += 1
+                kill.add(k)
+                break
+        doc["commands"] = [c for j, c in enumerate(cmds) if j not in kill]
+        Path(script_path).write_text(json.dumps(doc, indent=1))
+        dropped.append(name)
+        print(f"note: SolidCraft refused '{name}' (near-tangent boolean); dropped it and retried")
+    raise RuntimeError(f"solidcraft-cli still failing after dropping {max_drops} features")
 
 
 def main():
@@ -265,6 +298,7 @@ def main():
     ap.add_argument("ir")
     ap.add_argument("out", help="command script to write (JSON)")
     ap.add_argument("--run", metavar="FILE", help="run the CLI and export FILE (.step/.stl/.3mf)")
+    ap.add_argument("--save", metavar="FILE", help="also save a .solidcraft design file")
     ap.add_argument("--verify", action="store_true",
                     help="run the CLI, export STL, and gate the volume against build123d")
     a = ap.parse_args()
@@ -273,19 +307,32 @@ def main():
     Path(a.out).write_text(json.dumps({"commands": cmds}, indent=1))
     print(f"emitted {a.out}  ({len(cmds)} commands; run with: solidcraft-cli run {a.out} --out part.step)")
     if a.run:
-        run_script(a.out, a.run)
-        print(f"built {a.run}")
+        _, dropped = run_script(a.out, a.run, save=None if a.verify else a.save)
+        print(f"built {a.run}" + (f"  ({len(dropped)} feature(s) dropped: {dropped})" if dropped else ""))
     if a.verify:
+        import copy
+
         import b3d_emit
         import trimesh
         stl = Path(a.out).with_suffix(".sc.stl")
-        run_script(a.out, stl)
+        _, dropped = run_script(a.out, stl, save=a.save)
         v = float(trimesh.load(str(stl)).volume)
-        ref = b3d_emit.emit(_without_built_engravings(spec)[0])[1]["volume"]
+        base = _without_built_engravings(spec)[0]
+        if dropped:
+            # verify like against like: whatever SolidCraft refused is left out of the
+            # reference too, and the drop list is printed above for the record
+            low = IR.lower(copy.deepcopy(base))
+            low["features"] = [f for f in low["features"] if f.get("name") not in dropped]
+            base = low
+        ref = b3d_emit.emit(base)[1]["volume"]
         ok = G.volume_check(v, ref, rel=5e-3)
         print(f"solidcraft volume {v:.1f} mm^3  build123d {ref:.1f} mm^3  "
-              f"{'VERIFIED' if ok else 'DIFFERS'}")
+              f"{'VERIFIED' if ok else 'DIFFERS'}"
+              + (f"  ({len(dropped)} refused feature(s) left out of both)" if dropped else ""))
         return 0 if ok else 1
+    if a.save and not a.run:
+        _, dropped = run_script(a.out, Path(a.out).with_suffix(".sc.stl"), save=a.save)
+        print(f"saved {a.save}" + (f"  ({len(dropped)} dropped: {dropped})" if dropped else ""))
     return 0
 
 

@@ -249,16 +249,18 @@ def _facet_prisms(f, r, d, sgn, upoly, k0):
     import math
     from shapely.geometry import box
     s0, v0, s1, v1 = upoly.bounds
-    W = r * math.radians(30.0)
+    # facet width from the sag the detail can afford: a chord panel dips r(1-cos(w/2r)) at its
+    # edges, and a millimetre-scale groove or ridge cannot hide half a millimetre of scallop
+    allow = max(0.08, min(0.25, d / 4.0))
+    W = min(2.0 * r * math.acos(max(1.0 - allow / r, 0.0)), r * math.radians(30.0))
     n = max(1, int(math.ceil((s1 - s0) / W)))
     rp = r + sgn * d
     out = []
     for j in range(n):
-        # DISJOINT strips with a 0.2 mm gap, unlike a panel wrap's overlapping ones: a line is
-        # about as wide as any overlap would be, so overlapped facets would nearly duplicate
-        # each other wall-on-wall. The gap leaves a web thinner than scan noise every 30 deg,
-        # and the tools never touch, so no breathing jitter (which would distort the width).
-        clip = upoly.intersection(box(s0 + j * W + 0.1, v0 - 1.0, s0 + (j + 1) * W - 0.1, v1 + 1.0))
+        # strips overlap by half a millimetre so the groove is continuous — no webs dashing a
+        # cosmetic line every strip. The overlapped facet walls sit face-on-face, which only
+        # SolidCraft's checker refuses, and that backend keeps engravings as reference anyway.
+        clip = upoly.intersection(box(s0 + j * W - 0.25, v0 - 1.0, s0 + (j + 1) * W + 0.25, v1 + 1.0))
         for piece in (clip.geoms if clip.geom_type == "MultiPolygon" else [clip]):
             if piece.geom_type != "Polygon" or piece.area < 0.5 or len(piece.exterior.coords) < 4:
                 continue
@@ -308,14 +310,25 @@ def lower(spec):
     import math
     G = _geom()
     out = copy.deepcopy(spec)
-    feats, built_engs = [], []           # patterns and engravings expand first: backends never
-    for f in out["features"]:            # see either kind
+    feats, built_engs, engs = [], [], {}  # patterns and engravings expand first: backends never
+    for f in out["features"]:             # see either kind
         if f["kind"] == "pattern":
-            src = next(g for g in feats if g.get("name") == f["of"])
-            for i in range(1, f["count"]):
-                feats.append(_pattern_copy(src, f"{f['name']}_{i}",
-                                           f.get("angle_step", 0.0) * i, f.get("z_step", 0.0) * i))
+            if f["of"] in engs:           # a patterned engraving: a knurl ridge repeated along Z
+                src = engs[f["of"]]
+                for i in range(1, f["count"]):
+                    g = copy.deepcopy(src)
+                    g["name"] = f"{f['name']}_{i}"
+                    g["path"] = [[round((t + f.get("angle_step", 0.0) * i) % 360.0, 2),
+                                  round(z + f.get("z_step", 0.0) * i, 2)] for t, z in src["path"]]
+                    if g.get("build"):
+                        built_engs.append(g)
+            else:
+                src = next(g for g in feats if g.get("name") == f["of"])
+                for i in range(1, f["count"]):
+                    feats.append(_pattern_copy(src, f"{f['name']}_{i}",
+                                               f.get("angle_step", 0.0) * i, f.get("z_step", 0.0) * i))
         elif f["kind"] == "engrave":
+            engs[f["name"]] = f
             if f.get("build"):           # reference detailing stays out of the solid
                 built_engs.append(f)
         else:
@@ -518,7 +531,8 @@ def validate(spec):
             placed.add(n)
         elif k == "pattern":
             if f["of"] not in placed:
-                problems.append(f"{n}: pattern 'of' must name an earlier prism_cut / prism_pad")
+                problems.append(f"{n}: pattern 'of' must name an earlier prism_cut / prism_pad "
+                                f"/ engrave")
             if not f["count"] >= 2:
                 problems.append(f"{n}: a pattern needs count >= 2")
             if ("angle_step" in f) == ("z_step" in f):
@@ -529,6 +543,7 @@ def validate(spec):
             if not (f.get("width") or 0) > 0 or not (f.get("depth") or 0) > 0 \
                     or not (f.get("radius") or 0) > 0:
                 problems.append(f"{n}: an engraving needs positive width, depth and radius")
+            placed.add(n)
     return problems
 
 
