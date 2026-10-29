@@ -665,7 +665,11 @@ def _chord_poly(upoly, rm, rf, mirror):
     """A cylinder-space polygon mapped onto its facet's tangent plane as chords at radius `rf`.
     `mirror` flips u for a plane whose xdir runs against theta (a boss's inward-facing frame).
     Micro-edges are dropped: clipping a strip near an outline vertex leaves slivers of a tenth
-    of a millimetre, and the strict kernels refuse tools that carry them."""
+    of a millimetre, and the strict kernels refuse tools that carry them.
+    Chords, DELIBERATELY: emitting the contour as midpoint-fitted arc segments was tried, and
+    this OCP build's tessellator returns null meshes for the arc-walled prisms of every
+    feature class — smooth walls want the per-feature method competition with a kernel
+    acceptance test, not a blanket switch."""
     rf = max(rf, 1.0)
     pts = [((-1 if mirror else 1) * rf * math.sin(s / rm), v)
            for s, v in upoly.exterior.coords[:-1]]
@@ -745,14 +749,16 @@ def _core_levels(levels, rel, notes):
     return out
 
 
-def _level_profile(lv, rel, radius, min_amp=0.12, npts=72):
+def _level_profile(lv, rel, radius, npts=72):
     """A level's TRUE cross-section where the baseline's shape harmonics say it is not round:
-    the median harmonic coefficients over the level's span, sampled into a polygon around the
-    level's (snapped, core-based) radius. None where the level is round within noise — a lobed
-    grip stops masquerading as a cylinder, and the lobes stop having to be modelled as giant
-    shallow insets."""
+    the median harmonic coefficients over the level's span, emitted as a closed loop of ARCS
+    (each segment a true arc through a measured midpoint, bulge = 2 x sagitta / chord), so a
+    lobed level is a smooth swept profile in CAD, never a barrel of chord facets. None where
+    the level is round within noise — a true cylinder STAYS a circle, by model selection, not
+    by accident."""
     if not rel or not rel.get("base_coef"):
         return None
+    noise = float(rel.get("noise", 0.1))
     bz = np.asarray(rel["base_z"])
     C = np.asarray(rel["base_coef"])
     z0, z1 = lv["z"]
@@ -763,8 +769,12 @@ def _level_profile(lv, rel, radius, min_amp=0.12, npts=72):
     c = np.median(C[m], axis=0)
     H = (len(c) - 1) // 2
     amps = [math.hypot(c[2 * k - 1], c[2 * k]) for k in range(1, H + 1)]
-    if not amps or max(amps) < min_amp:
+    if not amps or max(amps) < max(0.12, 3.0 * noise):
         return None
+    # dense CHORDS, deliberately: near-circular arc segments carry bulges of a hundredth,
+    # whose enormous-radius slivers this OCP build's tessellator meshes to nothing. At 144
+    # points the chord sag is hundredths of a millimetre — far below the scan.
+    npts = 2 * npts
     t = (np.arange(npts) + 0.5) * 2 * np.pi / npts
     r = np.full(npts, float(radius))
     for k in range(1, H + 1):
