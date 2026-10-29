@@ -2,7 +2,7 @@
 
 [![Paper](https://img.shields.io/badge/paper-10.5281%2Fzenodo.22848792-blue)](https://doi.org/10.5281/zenodo.22848792)  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22848721.svg)](https://doi.org/10.5281/zenodo.22848721)  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Emit an editable feature tree — in FreeCAD *and* Onshape — from a small neutral feature-IR, round-trip human edits back by name, and render the same IR to a build123d solid.**
+**Emit an editable feature tree — in FreeCAD, Onshape *and* SolidCraft — from a small neutral feature-IR, round-trip human edits back by name, and render the same IR to a build123d solid. Recover that IR from a STEP file, a picture, or a raw 3D scan.**
 
 <!-- HERO GIF — record `docs/roundtrip.gif` (storyboard in LAUNCH.md), then uncomment:
 <p align="center">
@@ -107,6 +107,12 @@ json.dump(spec, open("bracket.ir.json", "w"))            # then: python3 gen.py 
   along an **arbitrary axis** at an **arbitrary location**. One primitive for any placed cut: a
   floor / through pocket along the main axis *or* a cross-axis hole ⊥ to it. This is what multi-axis
   STEP recovery emits; both backends build it identically.
+- `prism_pad(...)` — `prism_cut`'s **additive twin**: the same placed profile, fused on instead of
+  cut. This is how recovered *raised* features land — a grip rib, a thumb pad, a moulded boss.
+  `taper` drafts both the same way (positive shrinks the profile along +normal).
+- `pattern(name, of, count, angle_step=… | z_step=…)` — repeat an earlier placed feature about +Z
+  (polar) or along it (a stack). One editable count and one step — the design intent a ring of pads
+  actually carries. `ir.lower()` expands the copies, so no backend needs to know the feature exists.
 - `polar_pocket(name, radius, length, mount_r, z, count, phase)` — a ring of tangent bores.
 - `fillet(name, radius, select={"circles": "top_outer"})` — edges chosen by **query**, re-resolved to
   live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
@@ -285,25 +291,85 @@ python3 image_recognize.py part.png --spec guess.json --fit --size 60     # no m
 5. **Refine** (`--refine N`). Show the model its render beside the image and ask again.
 
 With `--mesh scan.stl` (a scan of the same part) the tree takes its size from the mesh and the
-result adds the volumetric overlap with it. [`mesh_compare.py`](mesh_compare.py) does this on its
-own, and measures a scan directly: the stepped outline, each hole (round, or a regular polygon
-with its across-flats size) and how far each rim is broken. It assumes the part's axis is the
-mesh's Z axis.
-
-```bash
-python3 mesh_compare.py scan.stl --spec out.json --scale
-python3 mesh_compare.py scan.stl --tree tree.json      # a tree straight from the measurements
-```
-
-`--tree` handles one family: round steps stacked along Z with through holes. Each recognised shape
-gets one size, so a hole whose flats agree within 0.3 mm becomes a single regular `ngon`, and
-equally spaced holes at one radius become one bolt circle. Sizes within 0.3 mm of a half
-millimetre are rounded to it.
+result adds the volumetric overlap with it ([Scan → IR](#scan--ir-mesh-recognition) below does
+this on its own).
 
 It reports the **silhouette overlap** and an **interior match** (edge correlation inside the
 outline, used to pick the spin of a round part). The overlap checks outline and proportions from
 one viewpoint. Holes and pockets inside the outline are the proposal's guess, the back of the part
 is unseen, and absolute size is whatever `--size` says. The image needs a plain background.
+
+## Scan → IR (mesh recognition)
+
+[`mesh_compare.py`](mesh_compare.py) recovers a parametric tree straight from a **3D scan** — a
+torn, noisy, open shell, not a clean B-rep. It assumes one thing: the part's axis is the mesh's Z.
+
+```bash
+python3 mesh_compare.py scan.stl --tree tree.json --relief   # measure -> a feature tree
+python3 mesh_compare.py scan.stl --spec tree.json            # score a tree against the scan
+```
+
+**Measure.** `measure()` slices the scan into *levels* — each a diameter, a height, its through
+holes (round, or a regular n-gon carried by one across-flats size) and how each rim breaks (a
+chamfer or a round, chosen by fitting both profiles). A blank band in the scan between two
+shrinking levels is bridged by a tapered cone rather than invented. `relief()` then reads the
+radius residual r(θ, z) off each slice's own median — the axisymmetric baseline — and segments it
+into patches: recesses, bosses, and full ring ribs/grooves (axisymmetric, so they hide in the
+baseline itself, not the residual). Every patch carries the **traced outline** of its floor, and
+the baseline curve rides along for tree().
+
+**Model.** `tree()` turns the measurements into the features a designer would have drawn:
+
+- Levels become circles and pads — re-based on the **core** radius where texture fattens them (a
+  slice's outer ring through a ribbed grip reads the rib *envelope*; built at it, the body buries
+  the real surface and swallows every boss that should stand proud).
+- A recess becomes a drafted moulded cut of its **traced contour**, placed on its own tangent
+  plane; the rounded rectangle survives only as a fallback. A boss becomes the mirrored
+  `prism_pad`, standing proud, its draft capped at the single digits a mould actually releases on.
+- Wider than a flat panel stays honest — to 120° for a recess (its flat floor is the mould
+  insert), 60° for a boss (its plateau follows the body) — and a wider *traced* feature still
+  lands, as a fan of chord **facets** in their own tangent frames, following the wrap.
+- Evenly spaced look-alikes collapse into one master + `ir.pattern` — four thumb pads come back
+  as *one* boss repeated 4 × 90°, unified on the median depth and draft (the two noisiest
+  estimates).
+- What can't be said honestly is a **note, never a guess**: too shallow, too wrapped, too
+  shapeless — and everything above the scan's last torn band, where slice data mixes the outer
+  wall with interior cavities into fictional features.
+
+**Score.** `compare()` reports slice-overlap IoU with a spin search — useful, but it cannot credit
+a cavity the scanner never resolved (a torn hex socket reads as *solid*). The honest number is the
+**deviation** in `sdf_recognize` below.
+
+On an Amazon Basics screwdriver scan (2M faces, torn chrome at the tip, 0.4 mm surface texture):
+an **81-feature tree** — ten turned steps and cones, a chamfer, twenty traced-contour moulded
+insets (three of them wrapped facet fans), twenty-plus boss pads with four collapsed into
+patterns, and the ¼″ hex bit socket — building to the **same volume in FreeCAD and build123d to
+the decimal**, SolidCraft **VERIFIED** (−0.12%), scan→CAD deviation median **0.385 mm** / p90
+0.98 mm, slice IoU 92.6%, volume +0.87%.
+
+## SDF recognition and the deviation score
+
+[`sdf_recognize.py`](sdf_recognize.py) sees what the Z-slicer cannot: it turns the scan and the
+rebuilt tree into **signed distance fields** (the sign from the generalized winding number, well
+defined on the open shells scanners produce) and decomposes their disagreement in full 3D.
+
+```bash
+python3 sdf_recognize.py scan.stl --spec tree.json --spin 359 --deviation --meshes out/parts/
+python3 sdf_recognize.py scan.stl --carve 1.5          # no tree: base / added / removed at scale r
+```
+
+- `residual()` — every connected component where scan and tree disagree is one **missed feature**,
+  signed: *added* is material the scan has and the tree lacks (a boss, a rib, an unmodelled tip);
+  *removed* is material the tree claims and the scan refutes (a recess, an on-axis socket invisible
+  to any slicer). Each reports volume, bounding box, centroid, reach, and on request a
+  marching-cubes mesh to look at. This is the work list the modelling above is built from.
+- `carve()` — the same decomposition by morphology alone, no tree needed: opening by a ball of
+  radius r strips everything thinner than r standing proud; closing fills every hollow narrower
+  than r.
+- `deviation()` — the **one-sided scan→CAD distance over observed points only**, the score a
+  Geomagic deviation colormap gives. It uses only what the scanner recorded, so it stays honest
+  where volumetric overlap lies: cutting the real (but torn) hex socket *lowered* both IoU
+  metrics and collapsed the tip's deviation p90 from 4.35 mm to 1.06 mm.
 
 ## Ingesting cadgen / text-to-cad assemblies — the editable round-trip for agent-generated CAD
 
@@ -371,6 +437,8 @@ Tests: `tests/test_assembly_loops.py`, `tests/test_threemf_emit.py`.
 | `cadgen_ingest.py` | host Python 3 | ingest a cadgen / text-to-cad STEP + `.step.json` sidecar (or tree package) → assembly IR, each part a verified editable tree |
 | `b3d_emit.py` | host Python 3 | render an IR spec → a build123d Solid (+ `.stl`) in-process, no FreeCAD |
 | `step_recognize.py` | host Python 3 | recover an IR from a STEP B-rep (2.5D-prismatic), self-verified by re-emit |
+| `mesh_compare.py` | host Python 3 | measure a 3D scan (levels, relief, traced outlines) and recover a feature tree from it; slice-IoU scoring |
+| `sdf_recognize.py` | host Python 3 | winding-number SDF residual / carve (the features a tree misses, in 3D) and the scan→CAD deviation score |
 | `gen.py` | host Python 3 | emit an IR spec → `.FCStd` (+ `.stl`); shells out to FreeCAD |
 | `roundtrip.py` | host Python 3 | read the tree / params back; optionally apply named edits |
 | `runner.py` | host Python 3 | locate / extract `freecadcmd`, run a script under it |
@@ -507,6 +575,11 @@ run `gen.py` / `roundtrip.py` directly), and make sure the FreeCAD AppImage is l
 - **STEP → IR recognition:** extrude / revolve in any orientation, arcs, any-shape through-holes, and
   **multi-axis recovery** (floor / through-web pockets + cross-axis holes) — self-verified by re-emit.
   See [STEP → IR](#step--ir-feature-recognition--round-trip-engineering).
+- **Scan → IR recognition:** round steps along Z with cones over scan blanks, rim chamfers/rounds,
+  holes and hex sockets, traced-contour moulded recesses, `prism_pad` bosses, wrapped facet fans,
+  and polar/stack patterns — scored by slice IoU and the one-sided scan→CAD deviation. Limits are
+  notes, never guesses: features wider than a wrap can carry, relief above a torn scan band, and
+  surface texture (knurling) are reported, not modelled. See [Scan → IR](#scan--ir-mesh-recognition).
 - **Onshape backend:** native Sketch / Extrude / Fillet / Revolve / Plane features with every
   reference stored as a FeatureScript query; polar_pocket and oblique prism_cut not yet; sketches
   arrive unconstrained. See [Onshape backend](#onshape-backend).
