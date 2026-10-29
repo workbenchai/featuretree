@@ -428,6 +428,11 @@ def update_from_params(spec, params):
             f["angle"] = p["angle"]
         if f["kind"] in ("prism_cut", "prism_pad") and ("depth" in p or "length" in p):
             f["depth"] = p.get("depth", p.get("length"))   # FreeCAD holds a placed cut as a Pocket: 'length'
+        if f["kind"] in ("prism_cut", "prism_pad") and "taper" in p:
+            if p["taper"]:                                 # the taper a kernel actually accepted
+                f["taper"] = float(p["taper"])
+            else:
+                f.pop("taper", None)
         if f["kind"] == "sketch" and "radii" in p:
             for i, r in enumerate(p["radii"]):
                 if i < len(f["circles"]):

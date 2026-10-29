@@ -264,20 +264,22 @@ def _skeleton_path(skel, nth):
     return path
 
 
-def _detail_lines(res, zs, nth, base, tol, min_len=8.0, max_width=3.0):
+def _detail_lines(res, zs, nth, base, thr, min_len=8.0, max_width=3.0, base2d=None):
     """LINE detailing in the residual — carved grooves and embossed ridges: each sign's
     well-past-noise mask, skeletonized; components that are narrow for their length (a line,
     not a panel) walked into an ordered (theta_deg, z) path with one width and depth each.
     Everything line-like but shorter than `min_len` is summarized, not pathed."""
     import scipy.ndimage as ndi
     from skimage.morphology import skeletonize
+    if base2d is None:
+        base2d = np.broadcast_to(np.asarray(base)[:, None], res.shape)
     rm = float(np.nanmedian(base))
     cw = rm * 2 * np.pi / nth
     ch = float(zs[1] - zs[0]) if len(zs) > 1 else 0.5
     out = {}
     for sign, key in ((-1, "carved"), (1, "embossed")):
         lines, short = [], {"count": 0, "length_mm": 0.0, "area_mm2": 0.0}
-        lab, _ = ndi.label(sign * res > 2 * tol, structure=np.ones((3, 3), int))
+        lab, _ = ndi.label(sign * res > thr, structure=np.ones((3, 3), int))
         for i in range(lab.shape[0]):                  # one surface: join across theta = 0
             a, b = lab[i, 0], lab[i, -1]
             if a and b and a != b:
@@ -305,14 +307,16 @@ def _detail_lines(res, zs, nth, base, tol, min_len=8.0, max_width=3.0):
                           "width": round(width, 2),
                           "depth": round(float(np.median(np.abs(res[sel]))), 2),
                           "length_mm": round(slen, 1),
-                          "radius": round(float(np.nanmedian(base[rows])), 2)})
+                          "radius": round(float(np.nanmedian(base2d[sel][np.isfinite(base2d[sel])]))
+                                          if np.isfinite(base2d[sel]).any()
+                                          else float(np.nanmedian(base[rows])), 2)})
         lines.sort(key=lambda e: -e["length_mm"])
         short = {k: round(v, 1) for k, v in short.items()}
         out[key] = {"lines": lines, "short": short}
     return out
 
 
-def _washboard(res, zs, nth, base, dz):
+def _washboard(res, zs, nth, base, dz, base2d=None):
     """Periodic grip texture — circumferential micro-ridges stacked along Z — read as THE
     PATTERN IT IS: per theta column, the longest band of sustained residual is autocorrelated
     along z; columns agreeing on a pitch cluster into sectors, and each sector folds all its
@@ -381,67 +385,149 @@ def _washboard(res, zs, nth, base, dz):
                         "height": round(height, 2),
                         "crest": round(float(fold.max()), 2),
                         "phase_z": round(float(zs[i0 + int(np.argmax(fold))]), 2),
-                        "radius": round(float(np.nanmedian(base[i0:i1])), 2)})
+                        "radius": round(float(np.nanmedian(
+                            base2d[i0:i1][:, run] if base2d is not None else base[i0:i1])), 2)})
         run = []
     return sectors
 
 
-def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
-    """What the outline carries AROUND the axis that the stepped levels cannot say: the radius
-    binned every 360/`nth` degrees at every `dz` of height, minus each slice's own median (the
-    axisymmetric baseline), segmented where it leaves ±`tol` mm into patches of at least
-    `min_area` mm². Each patch is classified by sign and angular coverage — a "recess" or "boss"
-    (an inset switch well, a grip panel, a moulded pad) — with its z span, centre angle and
-    angular span, depth (the deep decile, so a soft rim does not dilute a flat floor), mean body
-    radius there, arc width, area, and `fill` (how much of its bounding box it covers: 1.0 is a
-    clean rectangle). A patch also carries the traced `outline` of its floor (the 0.6 x depth
-    contour, as [theta_deg, z] points) so tree() can cut the measured shape, not a rectangle. A full "ring_rib" / "ring_groove" is axisymmetric and so invisible to the
-    residual; those are read off the baseline instead, as a bump or dip in base(z) that returns
-    to the surrounding radius (which a step shoulder does not).
-    Angles are about the mean slice centroid (`axis_xy`); `noise` is the median |residual|."""
-    import scipy.ndimage as ndi
+def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_000_000):
+    """The part's outer skin as a DISPLACEMENT MAP: the surface sampled uniformly (so a CAD
+    tessellation's bare flats and a scan's dense shell read alike), only outward-facing points
+    kept (an interior wall's normal points inward, so a socket cannot pollute the skin), every
+    point projected into (theta, z, r) about a trimmed-circle-fit axis and averaged into cells
+    of `dz` by 360/`nth` degrees — one pass over points, no slicing, close to the scan's own
+    resolution.
+
+    The baseline is a SURFACE, not a number per slice: per row, `harmonics` angular harmonics
+    are fitted robustly (features are outliers to the fit, and are reweighted away), so a
+    designed non-round body — a lobed grip, an oval section, a wandering axis (k = 1) — is
+    baseline, and the residual is purely what stands on or sinks into the designed surface.
+    k = 0 tracks the stepped radius unsmoothed; the shape harmonics are median-smoothed along z.
+
+    Returns {"axis", "z0", "dz", "nth", "zs", "R", "base", "base_r", "res", "valid"}."""
+    import trimesh
+    from scipy import ndimage as ndi
+    n = int(min(max(mesh.area * density, 200_000), max_pts))
+    try:                                   # seeded: the same mesh must measure the same twice
+        pts, fi = trimesh.sample.sample_surface(mesh, n, seed=0)
+    except TypeError:
+        np.random.seed(0)
+        pts, fi = trimesh.sample.sample_surface(mesh, n)
+    pts = np.asarray(pts, dtype=np.float64)
+    nrm = mesh.face_normals[fi]
     z0, z1 = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
-    zs = np.arange(z0 + dz, z1 - dz / 2, dz)
-    secs = slices(mesh, zs)
-    def _core_centre(s):
-        # the CORE circle's centre, not the outline's: a ring centroid is length-weighted, and
-        # one-sided texture (a sector of ridges) drags it by more than a millimetre, which then
-        # reads as a one-cycle wave across the whole residual field. Trim the proud points and
-        # circle-fit what remains, twice.
-        pts = np.asarray(_largest(s).exterior.segmentize(0.3).coords)
-        c = pts.mean(axis=0)
+
+    # axis: per 2 mm band, a trimmed Kasa circle fit of the band's points; the median centre
+    bands = np.floor((pts[:, 2] - z0) / 2.0).astype(int)
+    centres = []
+    for b in range(bands.max() + 1):
+        p = pts[bands == b][:, :2]
+        if len(p) < 40:
+            continue
+        c = p.mean(axis=0)
         for _ in range(2):
-            r = np.hypot(pts[:, 0] - c[0], pts[:, 1] - c[1])
-            keep = pts[r <= np.median(r) + 0.5]
-            if len(keep) < 8:
+            r = np.hypot(p[:, 0] - c[0], p[:, 1] - c[1])
+            keep = p[r <= np.median(r) + 0.5]
+            if len(keep) < 20:
                 break
             A = np.c_[keep[:, 0], keep[:, 1], np.ones(len(keep))]
             x, *_ = np.linalg.lstsq(A, (keep ** 2).sum(axis=1), rcond=None)
             c = np.array([x[0] / 2, x[1] / 2])
-        return c
-    ax = np.median([_core_centre(s) for s in secs if s is not None], axis=0)
-    R = np.full((len(zs), nth), np.nan)
-    for i, s in enumerate(secs):
-        if s is None:
+        centres.append(c)
+    ax = np.median(centres, axis=0) if centres else np.zeros(2)
+
+    dx, dy = pts[:, 0] - ax[0], pts[:, 1] - ax[1]
+    r = np.hypot(dx, dy)
+    ok = r > 1e-6
+    out = (nrm[:, 0] * dx + nrm[:, 1] * dy) / np.maximum(r, 1e-6) > 0.2
+    keep = ok & out
+    pts, r, dx, dy = pts[keep], r[keep], dx[keep], dy[keep]
+    rows = np.clip(np.floor((pts[:, 2] - z0) / dz).astype(int), 0, None)
+    nz = int(np.ceil((z1 - z0) / dz))
+    rows = np.clip(rows, 0, nz - 1)
+    cols = np.floor(np.arctan2(dy, dx) / (2 * np.pi) * nth).astype(int) % nth
+    flat = rows * nth + cols
+    cnt = np.bincount(flat, minlength=nz * nth).reshape(nz, nth)
+    # per cell, the OUTERMOST radius — the skin. A mean would average in whatever lies under
+    # it: an internal wall running behind a rib (scanners never record those, but a sampled
+    # fixture has them), a torn inner surface leaking through. Max biases outward by a fraction
+    # of the noise, uniformly, which the baseline absorbs.
+    Rmax = np.full(nz * nth, -np.inf)
+    np.maximum.at(Rmax, flat, r)
+    R = np.where(cnt.reshape(-1) > 0, Rmax, np.nan).reshape(nz, nth)
+    # fill pinholes from neighbours (sampling is Poisson), then a light blur at cell scale
+    for _ in range(3):
+        if not np.isnan(R).any():
+            break
+        f = np.where(np.isnan(R), 0.0, R)
+        c = (~np.isnan(R)).astype(float)
+        k = np.ones((3, 3))
+        fs = ndi.convolve(f, k, mode="wrap")
+        cs = ndi.convolve(c, k, mode="wrap")
+        R = np.where(np.isnan(R) & (cs > 0), fs / np.maximum(cs, 1), R)
+    valid = ~np.isnan(R)
+    # a 3x3 median knocks down per-cell sampling noise WITHOUT softening steps — a gaussian
+    # here read a sharp rib 0.1 low and gave it 0.75 mm of fictional shoulder
+    R = np.where(valid, ndi.median_filter(np.where(valid, R, 0.0), size=3, mode="wrap"), np.nan)
+
+    th_c = (np.arange(nth) + 0.5) * 2 * np.pi / nth
+    basis = [np.ones(nth)]
+    for k in range(1, harmonics + 1):
+        basis += [np.cos(k * th_c), np.sin(k * th_c)]
+    M = np.column_stack(basis)
+    coef = np.zeros((nz, M.shape[1]))
+    for i in range(nz):
+        wrow = valid[i]
+        if wrow.sum() < 4 * M.shape[1]:
+            coef[i] = np.nan
             continue
-        ext = _largest(s).exterior
-        pts = np.asarray(ext.segmentize(max(ext.length / (2 * nth), 0.05)).coords)
-        th = np.arctan2(pts[:, 1] - ax[1], pts[:, 0] - ax[0])
-        # floor, never truncate: astype(int) rounds toward zero, which makes the bin at 180
-        # degrees a measure-zero sliver that almost never receives a point — and an always-empty
-        # column silently split every patch, label and line that crossed the 180 meridian
-        b = np.floor(th / (2 * np.pi) * nth).astype(int) % nth
-        r = np.hypot(pts[:, 0] - ax[0], pts[:, 1] - ax[1])
-        sums, cnt = np.zeros(nth), np.zeros(nth)
-        np.add.at(sums, b, r)
-        np.add.at(cnt, b, 1)
-        R[i, cnt > 0] = sums[cnt > 0] / cnt[cnt > 0]
-    rows_ok = ~np.isnan(R).all(axis=1)
-    base = np.full(len(zs), np.nan)
-    base[rows_ok] = np.nanmedian(R[rows_ok], axis=1)
-    res = R - base[:, None]
-    valid = ~np.isnan(res)
-    r0 = np.where(valid, res, 0.0)
+        # an L1 (least-absolute-deviations) fit, by iterative reweighting: a least-squares
+        # baseline bows into every feature, and trimming around the bowed fit locks onto its
+        # own bias — while the median property holds to 50% contamination, and even the widest
+        # wrap covers a third of a row. Features simply do not vote.
+        Mw, Rw = M[wrow], R[i, wrow]
+        x = np.concatenate([[np.median(Rw)], np.zeros(M.shape[1] - 1)])
+        for _ in range(8):
+            resid = Rw - Mw @ x
+            w = 1.0 / np.maximum(np.abs(resid), 0.05)
+            x2, *_ = np.linalg.lstsq(Mw * w[:, None], Rw * w, rcond=None)
+            if not np.isfinite(x2).all():
+                break
+            x = x2
+        coef[i] = x if np.isfinite(x).all() else np.nan
+    good = ~np.isnan(coef[:, 0])
+    if harmonics >= 1 and good.sum() >= 5:
+        win = max(3, int(3.0 / dz) | 1)
+        for j in range(1, coef.shape[1]):          # smooth the SHAPE along z; k = 0 tracks steps
+            coef[good, j] = ndi.median_filter(coef[good, j], size=win, mode="nearest")
+    base2d = coef @ M.T
+    res = R - base2d
+    zs = z0 + (np.arange(nz) + 0.5) * dz
+    return {"axis": ax, "z0": z0, "dz": dz, "nth": nth, "zs": zs, "R": R,
+            "base": base2d, "base_r": coef[:, 0], "coef": coef, "res": res, "valid": valid}
+
+
+def relief(mesh, dz=0.25, nth=720, tol=0.3, min_area=20.0):
+    """What the surface carries AROUND the axis that the stepped levels cannot say: the
+    displacement map's residual (see displacement() — vertex-resolution, harmonic baseline),
+    segmented where it leaves ±`tol` mm into patches of at least `min_area` mm². Each patch is
+    classified by sign and angular coverage — a "recess" or "boss" (an inset switch well, a
+    grip panel, a moulded pad) — with its z span, centre angle and angular span, depth (the
+    deep decile, so a soft rim does not dilute a flat floor), mean body radius there, arc
+    width, area, and `fill` (how much of its bounding box it covers: 1.0 is a clean
+    rectangle). A patch also carries the traced `outline` of its floor (the 0.6 x depth
+    contour, as [theta_deg, z] points) so tree() can cut the measured shape, not a rectangle.
+    A full "ring_rib" / "ring_groove" is axisymmetric and so invisible to the residual; those
+    are read off the baseline instead, as a bump or dip in base(z) that returns to the
+    surrounding radius (which a step shoulder does not). `noise` is the median |residual|."""
+    import scipy.ndimage as ndi
+    d = displacement(mesh, dz=dz, nth=nth)
+    ax, zs, coef = d["axis"], d["zs"], d["coef"]
+    base, base2d, res, valid = d["base_r"], d["base"], d["res"], d["valid"]
+    rows_ok = valid.any(axis=1) & ~np.isnan(base)
+    r0 = np.where(valid & ~np.isnan(res), res, 0.0)
+    res = np.where(valid, res, np.nan)
     patches = []
 
     # a full ring rib / groove is axisymmetric, so it hides in the baseline itself, not in the
@@ -485,7 +571,11 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
         for L in np.unique(lab)[1:]:
             cells = np.argwhere(lab == L)
             rows, cols = cells[:, 0], cells[:, 1]
-            rm = float(np.nanmean(base[np.unique(rows)]))
+            # the LOCAL baseline radius under the patch, not the row average: on a lobed body
+            # the two differ by the whole lobe, and every placed cut and pad roots at this
+            loc = base2d[lab == L]
+            rm = float(np.nanmean(loc[np.isfinite(loc)])) if np.isfinite(loc).any() \
+                else float(np.nanmean(base[np.unique(rows)]))
             area = len(cells) * rm * (2 * np.pi / nth) * dz
             if area < min_area:
                 continue
@@ -518,8 +608,14 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
             # it, because a slice's outer ring reads the rib ENVELOPE, not the body
             "base_z": [round(float(z), 2) for z in zs[rows_ok]],
             "base_r": [round(float(r), 3) for r in base[rows_ok]],
-            "detail": _detail_lines(r0, zs, nth, base, tol),
-            "washboard": _washboard(r0, zs, nth, base, dz),
+            "base_coef": [[round(float(v), 3) for v in row] for row in coef[rows_ok]],
+            # the line threshold follows the MEASURED noise, not the patch tolerance: on a
+            # clean harmonic-baseline map a knurl ridge of half the old threshold is an
+            # eight-sigma object, and gating it at panel scale silently erased the texture
+            "detail": _detail_lines(r0, zs, nth, base,
+                                    max(0.2, 4.0 * float(np.nanmedian(np.abs(res[valid])))),
+                                    base2d=base2d),
+            "washboard": _washboard(r0, zs, nth, base, dz, base2d=base2d),
             "patches": patches}
 
 
@@ -649,6 +745,35 @@ def _core_levels(levels, rel, notes):
     return out
 
 
+def _level_profile(lv, rel, radius, min_amp=0.12, npts=72):
+    """A level's TRUE cross-section where the baseline's shape harmonics say it is not round:
+    the median harmonic coefficients over the level's span, sampled into a polygon around the
+    level's (snapped, core-based) radius. None where the level is round within noise — a lobed
+    grip stops masquerading as a cylinder, and the lobes stop having to be modelled as giant
+    shallow insets."""
+    if not rel or not rel.get("base_coef"):
+        return None
+    bz = np.asarray(rel["base_z"])
+    C = np.asarray(rel["base_coef"])
+    z0, z1 = lv["z"]
+    pad = 0.2 * (z1 - z0)
+    m = (bz >= z0 + pad) & (bz <= z1 - pad)
+    if m.sum() < 3:
+        return None
+    c = np.median(C[m], axis=0)
+    H = (len(c) - 1) // 2
+    amps = [math.hypot(c[2 * k - 1], c[2 * k]) for k in range(1, H + 1)]
+    if not amps or max(amps) < min_amp:
+        return None
+    t = (np.arange(npts) + 0.5) * 2 * np.pi / npts
+    r = np.full(npts, float(radius))
+    for k in range(1, H + 1):
+        r = r + c[2 * k - 1] * np.cos(k * t) + c[2 * k] * np.sin(k * t)
+    pts = [[round(float(rr * math.cos(tt)), 3), round(float(rr * math.sin(tt)), 3)]
+           for rr, tt in zip(r, t)]
+    return [pts], round(max(amps), 2)
+
+
 def tree(measured, snap=True):
     """A feature tree from measure()'s output, for parts this module can describe: round steps
     stacked along Z, with through holes that are round or regular polygons. Returns (spec, notes).
@@ -692,8 +817,16 @@ def tree(measured, snap=True):
     feats, breaks, prev, coned = [], [], None, set()
     for i, lv in enumerate(levels):
         d, h = diam[i], sn(ends[i] - starts[i])
-        feats.append(IR.sketch(f"step{i + 1}_outline", circles=[(0, 0, d / 2)],
-                               on={"face_of": prev, "side": "top"} if prev else None))
+        prof = _level_profile(lv, measured.get("relief"), d / 2)
+        if prof:
+            polys, amp = prof
+            feats.append(IR.sketch(f"step{i + 1}_outline", polys=polys,
+                                   on={"face_of": prev, "side": "top"} if prev else None))
+            notes.append(f"step{i + 1}: not round — the baseline's shape harmonics "
+                         f"(up to ±{amp} mm) are kept in its profile")
+        else:
+            feats.append(IR.sketch(f"step{i + 1}_outline", circles=[(0, 0, d / 2)],
+                                   on={"face_of": prev, "side": "top"} if prev else None))
         prev = f"step{i + 1}"
         feats.append(IR.pad(prev, f"step{i + 1}_outline", h))
         if i < len(bounds) and bounds[i][0] == "cone":
@@ -887,7 +1020,9 @@ def tree(measured, snap=True):
         if (torn_above is not None and zmid > torn_above) or wb["z"][0] < z0f + 2.0:
             continue
         count = int((wb["z"][1] - wb["phase_z"]) // wb["pitch"]) + 1
-        if count < 4:
+        # narrow, faint "sectors" flanking a real one are the baseline harmonics ringing in
+        # phase with the ridges, not grip texture
+        if count < 4 or wb["theta_deg"][1] < 15.0 or wb.get("crest", 0.0) < 0.3:
             continue
         half = wb["theta_deg"][1] / 2 - 1.0
         angs = np.arange(wb["theta_deg"][0] - half, wb["theta_deg"][0] + half + 2.0, 4.0)
@@ -903,18 +1038,43 @@ def tree(measured, snap=True):
             continue
         k += 1
         path = [(a % 360, wb["phase_z"] - z0f) for a in angs]
-        crest = max(wb.get("crest", round(wb["height"] / 2, 2)), 0.2)
+        # peak-to-valley and the top surface are the split-invariant measurements (a 50%-duty
+        # washboard is "base + ridges" or "bulge + grooves" with equal right, and the harmonic
+        # baseline may take either): the ridge is its full height, rooted so its plateau lands
+        # at the measured top
+        depth = max(round(wb["height"], 2), 0.2)
+        root = round(wb["radius"] + wb.get("crest", wb["height"] / 2) - wb["height"], 2)
         breaks.append(IR.engrave(f"washboard{k}", path, width=wb["ridge_width"],
-                                 depth=crest, side="emboss",
-                                 radius=wb["radius"], build=True))
+                                 depth=depth, side="emboss",
+                                 radius=root, build=True))
         breaks.append(IR.pattern(f"washboard{k}_stack", f"washboard{k}", count,
                                  z_step=wb["pitch"]))
         notes.append(f"washboard{k}: grip ridges at {wb['theta_deg'][0]} deg "
                      f"({wb['theta_deg'][1]} deg wide), one {wb['ridge_width']} mm ridge "
-                     f"standing {crest} mm proud, repeated "
+                     f"standing {depth} mm peak to valley, repeated "
                      f"{count} x every {wb['pitch']} mm (z {wb['z'][0]}..{wb['z'][1]})")
     breaks = _coalesce_patterns(breaks, notes)
-    return IR.part("part", *feats, *breaks), notes
+    spec = IR.part("part", *feats, *breaks)
+    # tapers are decided ONCE, by the reference kernel: each backend's own back-off would
+    # retreat differently on a marginal traced profile, and three kernels would build three
+    # slightly different parts. The taper build123d accepts is baked into the IR; the other
+    # backends then execute the same geometry, their ladders reduced to a safety net.
+    try:
+        import b3d_emit
+        _, ref = b3d_emit.emit(spec)
+        baked = {n: {"taper": p.get("taper", 0.0)}
+                 for n, p in ref["params"].items() if "taper" in p}
+        before = {f["name"]: f.get("taper", 0.0) for f in spec["features"]
+                  if f["kind"] in ("prism_cut", "prism_pad")}
+        IR.update_from_params(spec, baked)
+        changed = sum(1 for n, t in before.items()
+                      if n in baked and abs(baked[n]["taper"] - t) > 0.05)
+        if changed:
+            notes.append(f"{changed} drafted cut(s)/pad(s) reduced to the taper the kernel "
+                         f"accepts; baked, so every backend builds the same geometry")
+    except Exception:
+        pass
+    return spec, notes
 
 
 def _coalesce_patterns(feats, notes):

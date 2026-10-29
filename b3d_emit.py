@@ -396,9 +396,9 @@ def _emit(spec):
                         part = (part + tool) if kind == "prism_pad" else _cut(part, tool)
                         break
                     except Exception:
-                        if abs(taper) < 5.0:
-                            raise
-                        taper = round(taper / 2.0, 1)
+                        if taper == 0.0:
+                            raise               # a straight prism cannot offset-fail; something else
+                        taper = 0.0 if abs(taper) < 5.0 else round(taper / 2.0, 1)
             params[f["name"]] = {"depth": round(float(f["depth"]), 4),
                                  **({"taper": taper} if f.get("taper") else {})}
         else:
