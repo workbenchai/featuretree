@@ -50,8 +50,10 @@ SINK = 1e-3
 # A TAPERED pad flush on a step (a recognized cone) osculates the wall below along its base
 # circle and the step above along its top circle, and SolidCraft's union refuses tangent seams
 # at any sink depth ("no result"). Its base circle is widened by this sliver instead, so both
-# seams cross transversally; the silhouette error (20 um) is far below scan resolution.
-BITE = 0.02
+# seams cross transversally. It must beat SolidCraft's REFINED merge tolerance (~0.09 mm, from
+# its own error text), which swallowed the original 0.02: a cone top 19 um clear of the next
+# step's wall still read as tangent. The silhouette error stays well below scan resolution.
+BITE = 0.12
 
 
 def cli_path():

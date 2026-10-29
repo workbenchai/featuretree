@@ -343,7 +343,12 @@ def relief(mesh, dz=0.5, nth=360, tol=0.3, min_area=20.0):
                             **({"outline": outline} if outline else {})})
     patches.sort(key=lambda p: -p["area_mm2"])
     return {"axis_xy": [round(float(ax[0]), 2), round(float(ax[1]), 2)], "dz": dz, "tol": tol,
-            "noise": round(float(np.nanmedian(np.abs(res[valid]))), 3), "patches": patches}
+            "noise": round(float(np.nanmedian(np.abs(res[valid]))), 3),
+            # the axisymmetric CORE the texture stands on: tree() re-bases textured levels on
+            # it, because a slice's outer ring reads the rib ENVELOPE, not the body
+            "base_z": [round(float(z), 2) for z in zs[rows_ok]],
+            "base_r": [round(float(r), 3) for r in base[rows_ok]],
+            "patches": patches}
 
 
 def _snap(v, grid=0.5, within=0.3):
@@ -398,7 +403,7 @@ def _chord_poly(upoly, rm, rf, mirror):
     return [(round(x, 3), round(y, 3), 0) for x, y in (kept if len(kept) >= 3 else pts)]
 
 
-def _facets(upoly, ang, rm, width_deg=30.0, overlap=1.0):
+def _facets(upoly, ang, rm, width_deg=30.0, overlap=1.0, reverse=False):
     """A wide cylinder-space polygon split into chord-sized facets: (centre angle, polygon
     recentred on it) per piece, each narrow enough for a flat tangent panel to stay honest.
     Adjacent strips overlap well past flushness so their booleans cross transversally."""
@@ -427,10 +432,40 @@ def _facets(upoly, ang, rm, width_deg=30.0, overlap=1.0):
                                    yfact=1.0 + eps / max((b[3] - b[1]) / 2, 1.0), origin="center")
             out.append((ang + math.degrees(smid / rm),
                         affinity.translate(piece, xoff=-smid)))
-    # last strip first: a terminus facet (the wrap's rounded end) cuts cleanly into virgin
-    # material, but SolidCraft's checker refuses any LATER facet that cuts beside its void —
-    # found empirically (every order ending with the first strip passes, no other does)
-    return out[::-1]
+    # strip order matters to SolidCraft's checker, and CUTS and PADS mirror each other (found
+    # empirically, one wrap at a time): a cut wrap must end on its first strip, a pad wrap must
+    # begin with it — so cuts run reversed and pads forward
+    return out[::-1] if reverse else out
+
+
+def _core_levels(levels, rel, notes):
+    """Levels re-based on the axisymmetric CORE (relief's baseline) where texture fattens them:
+    a slice's outer ring through a ribbed grip reads the rib ENVELOPE, so the level pad built
+    from it swallows most of every boss that should stand proud and buries the real surface
+    well inside the solid. Where the envelope exceeds the baseline meaningfully, the level's
+    diameter becomes the core's; the ribs then stand on it as the pads they are."""
+    if not rel or not rel.get("base_z"):
+        return levels
+    bz, br = np.asarray(rel["base_z"]), np.asarray(rel["base_r"])
+    tol = rel.get("tol", 0.3)
+    out = []
+    for lv in levels:
+        z0, z1 = lv["z"]
+        pad = 0.2 * (z1 - z0)
+        m = (bz >= z0 + pad) & (bz <= z1 - pad) & ~np.isnan(br)
+        lv = dict(lv)
+        if m.sum() >= 3:
+            core = float(np.median(br[m]))
+            drop = lv["outer_diameter"] / 2 - core
+            # the baseline median is steady (it averages whole slices), so even a fraction of
+            # the residual tolerance is signal; untextured levels measure within ~0.1 of it
+            if drop > max(tol / 2, 0.15):
+                notes.append(f"level z {z0}..{z1}: textured — based on the core radius "
+                             f"{round(core, 2)} (the outer envelope {lv['outer_diameter'] / 2} "
+                             f"is carried by its ribs)")
+                lv["outer_diameter"] = round(2 * core, 2)
+        out.append(lv)
+    return out
 
 
 def tree(measured, snap=True):
@@ -449,7 +484,8 @@ def tree(measured, snap=True):
     ValueError or is listed in the notes."""
     import ir as IR
     sn = _snap if snap else (lambda v, *a, **k: round(v, 3))
-    levels, notes = measured["levels"], []
+    notes = []
+    levels = _core_levels(measured["levels"], measured.get("relief"), notes)
     bumpy = [lv for lv in levels if not lv["round"]]
     if not levels or (bumpy and not measured.get("relief")):
         raise ValueError("only parts made of round steps along Z are handled "
@@ -767,10 +803,15 @@ def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, n
         elif g["span"] > single_max:
             # facet side walls must mate exactly where the strips meet, so the facets of a
             # wrap carry no draft: a taper would swell every strip into its neighbours
-            pieces, taper = _facets(upoly, ang, rm), 0.0
+            pieces, taper = _facets(upoly, ang, rm, reverse=sgn < 0), 0.0
         else:
             taper = max(taper, -45.0)      # a traced contour is concave: keep its offset sane
             pieces = [(ang, upoly)]
+        if sgn > 0:
+            # a moulded rib releases on single-digit draft; the ramp estimate on a band
+            # thinner than its wall run reads as a 40-degree wedge whose base swallows the
+            # neighbouring ribs (and whose unions the kernels then refuse)
+            taper = max(taper, -8.0)
         if not pieces:
             continue
         rf = rm + sgn * 0.8 * t_raw
