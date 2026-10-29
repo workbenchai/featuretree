@@ -187,7 +187,7 @@ def test_a_moulded_boss_comes_back_as_a_prism_pad():
     assert MC.compare(made, mesh)["iou_pct"] > 99
 
 
-def test_carved_line_detailing_comes_back_as_a_reference_engraving():
+def test_carved_line_detailing_comes_back_and_cuts_again():
     import math
     wave = [(t, 20 + 6 * math.sin(math.radians(t))) for t in range(0, 361, 10)]
     src = IR.part(
@@ -203,12 +203,14 @@ def test_carved_line_detailing_comes_back_as_a_reference_engraving():
     m["relief"] = MC.relief(mesh)
     made, notes = MC.tree(m)
     eng = [f for f in made["features"] if f["kind"] == "engrave"]
-    assert eng and eng[0]["side"] == "carve" and not eng[0]["build"]
+    assert eng and eng[0]["side"] == "carve" and eng[0]["build"]
     assert 1.0 < eng[0]["width"] < 2.8 and 0.5 < eng[0]["depth"] < 1.4
-    assert any("reference engraving" in n for n in notes)
+    assert any("modelled as engravings" in n for n in notes)
     assert not IR.validate(made)
-    # reference by default: the recovered tree rebuilds the bare drum, volumes stay comparable
-    assert MC.spec_mesh(made).volume == pytest.approx(bare, rel=0.02)
+    # a recovered groove is product geometry: the rebuilt tree carves it back out
+    rebuilt = MC.spec_mesh(made).volume
+    assert rebuilt < bare - 30
+    assert rebuilt == pytest.approx(mesh.volume, rel=0.01)
 
 
 def test_a_ring_of_bosses_comes_back_as_one_pattern():

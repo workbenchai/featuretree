@@ -113,11 +113,14 @@ json.dump(spec, open("bracket.ir.json", "w"))            # then: python3 gen.py 
 - `pattern(name, of, count, angle_step=… | z_step=…)` — repeat an earlier placed feature about +Z
   (polar) or along it (a stack). One editable count and one step — the design intent a ring of pads
   actually carries. `ir.lower()` expands the copies, so no backend needs to know the feature exists.
-- `engrave(name, path, width, depth, side="carve"|"emboss", radius)` — line detailing on a
-  cylindrical surface: a carved groove or embossed ridge following a (θ, z) path with one width
-  and one depth. **Reference by default** — the tree carries the measured design intent, every
-  backend skips it alike, and volumes stay comparable; `build=True` has `lower()` expand it into
-  placed prism segments when the booleans are wanted.
+- `engrave(name, path, width, depth, side="carve"|"emboss", radius, build=False)` — line
+  detailing on a cylindrical surface: a carved groove or embossed ridge following a (θ, z) path
+  with one width and one depth. With `build=True`, `lower()` expands each side's lines as one
+  **disjoint layer** (every line's tool differenced against the lines before it, split into
+  chord facets) so detail booleans never touch each other; build123d and FreeCAD then build
+  them to matching volume. SolidCraft is the exception: its boolean checker refuses the
+  near-surface slivers detailing cuts, so that emitter demotes built engravings to reference
+  with a printed notice and verifies like against like.
 - `polar_pocket(name, radius, length, mount_r, z, count, phase)` — a ring of tangent bores.
 - `fillet(name, radius, select={"circles": "top_outer"})` — edges chosen by **query**, re-resolved to
   live `EdgeN` every build (never a stored kernel id — the topological-naming sidestep).
@@ -338,9 +341,11 @@ the baseline curve rides along for tree().
   as *one* boss repeated 4 × 90°, unified on the median depth and draft (the two noisiest
   estimates).
 - Line detailing — carved contour lines, embossed ridges, logo-style line art — is skeletonized
-  out of the residual into **reference `engrave` features**: a named path with one measured width
-  and depth each, in the tree without turning every rebuild into hundreds of micro-booleans.
-  Sub-8 mm segments are summarized as a texture field.
+  out of the residual into **`engrave` features**, each a named path with one measured width and
+  depth, built as real cuts and ridges. A line that merely traces a modelled panel's outline at
+  the panel's own depth is that panel's wall read back out of the residual, and is refused; a
+  real groove crossing a panel's interior deeper than its floor stays. Sub-8 mm segments are
+  summarized as a texture field.
 - What can't be said honestly is a **note, never a guess**: too shallow, too wrapped, too
   shapeless — and everything above the scan's last torn band or in the first millimetres of an
   end face, where slice data writes fictional features into the residual.

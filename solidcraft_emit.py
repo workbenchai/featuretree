@@ -214,6 +214,12 @@ class Emitter:
             self._placed_cut(f"{f['name']}_{i + 1}", fr, loops, depth)
 
     def build(self, spec):
+        spec, skipped = _without_built_engravings(spec)
+        if skipped:
+            print(f"note: {skipped} built engraving(s) left out of the SolidCraft script — its "
+                  f"boolean checker refuses the near-surface slivers line detailing cuts; they "
+                  f"stay in the IR and the other backends build them (--verify compares like "
+                  f"against like)")
         lowered = IR.lower(spec)["features"]
         attached = {f["name"] for f in lowered if f["kind"] == "sketch" and f.get("on")}
         self.bitten = {f["sketch"] for f in lowered
@@ -221,6 +227,22 @@ class Emitter:
         for f in lowered:
             getattr(self, "f_" + f["kind"])(f)
         return self.cmds
+
+
+def _without_built_engravings(spec):
+    """The spec with every built engraving demoted to reference — the SolidCraft scope line.
+    Its boolean checker refuses near-surface sliver tools wherever they graze other geometry
+    (panel floors, level shoulders), which is everywhere line detailing lives. Returns the
+    copy and how many engravings were demoted."""
+    import copy
+    n = sum(1 for f in spec["features"] if f.get("kind") == "engrave" and f.get("build"))
+    if not n:
+        return spec, 0
+    out = copy.deepcopy(spec)
+    for f in out["features"]:
+        if f.get("kind") == "engrave":
+            f["build"] = False
+    return out, n
 
 
 def emit(spec):
@@ -259,7 +281,7 @@ def main():
         stl = Path(a.out).with_suffix(".sc.stl")
         run_script(a.out, stl)
         v = float(trimesh.load(str(stl)).volume)
-        ref = b3d_emit.emit(spec)[1]["volume"]
+        ref = b3d_emit.emit(_without_built_engravings(spec)[0])[1]["volume"]
         ok = G.volume_check(v, ref, rel=5e-3)
         print(f"solidcraft volume {v:.1f} mm^3  build123d {ref:.1f} mm^3  "
               f"{'VERIFIED' if ok else 'DIFFERS'}")

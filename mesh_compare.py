@@ -694,8 +694,9 @@ def tree(measured, snap=True):
             notes.append(f"{p['kind'].replace('_', ' ')} z {p['z'][0]}..{p['z'][1]} at "
                          f"{p['theta_deg'][0]} deg ({p['theta_deg'][1]} deg wide), {p['depth']} mm: "
                          f"seen but not modelled")
+    covered = []                 # (ang, span, z0, z1) of every panel that became a feature
     for pkind, sgn, fname in (("recess", -1, "inset"), ("boss", 1, "boss")):
-        _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes)
+        _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes, covered)
     det = (measured.get("relief") or {}).get("detail")
     if det:
         # line detailing — carved contour lines, embossed ridges — lands as named, dimensioned
@@ -714,14 +715,39 @@ def tree(measured, snap=True):
                 # face read edge-on writes fictional lines into the residual
                 if (torn_above is not None and zmid > torn_above) or zmid < z0f + 2.0:
                     continue
+                # a "line" thinner than the scan can resolve is an edge of something else
+                if e["width"] < 0.3:
+                    continue
+                # a line inside a modelled panel is either the panel's own wall read back out
+                # of the residual (it hugs the traced outline, at about the panel's depth —
+                # cutting it would double the edge and osculate the floor) or a REAL groove
+                # crossing the interior deeper than the floor, which stays
+                from shapely.geometry import Point
+                near = deep = 0
+                tmax = 0.0
+                for t_, z_ in e["path"]:
+                    for a, zm, prm, pt_, poly_ in covered:
+                        p = Point(math.radians((t_ - a + 180) % 360 - 180) * prm, z_ - zm)
+                        if poly_.covers(p):
+                            tmax = max(tmax, pt_)
+                            if poly_.exterior.distance(p) < 1.2:
+                                near += 1
+                            else:
+                                deep += 1
+                            break
+                contained = near + deep
+                if contained >= 0.5 * len(e["path"]) \
+                        and (near >= 0.7 * contained or e["depth"] < tmax + 0.35):
+                    continue
                 k += 1
                 kept += 1
                 breaks.append(IR.engrave(f"line{k}", [(t, z - z0f) for t, z in e["path"]],
-                                         e["width"], e["depth"], side=side, radius=e["radius"]))
+                                         e["width"], e["depth"], side=side, radius=e["radius"],
+                                         build=True))
             if kept:
                 tot = sum(e["length_mm"] for e in det[key]["lines"])
-                notes.append(f"{kept} {key} line(s), {round(tot)} mm of path in all, kept as "
-                             f"reference engravings (ir.engrave, build=False)")
+                notes.append(f"{kept} {key} line(s), {round(tot)} mm of path in all, modelled as "
+                             f"engravings (ir.engrave, built as chord-facet prisms)")
             sh = det.get(key, {}).get("short", {})
             if sh.get("count"):
                 notes.append(f"{key} texture: {sh['count']} segments under 8 mm "
@@ -824,7 +850,7 @@ def _coalesce_patterns(feats, notes):
     return out
 
 
-def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes):
+def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes, covered=None):
     """The relief patches of one sign as placed features: recesses (sgn -1) become drafted
     prism_cuts into the body, bosses (sgn +1) become drafted prism_pads standing proud of it —
     the same construction mirrored through the surface. Recess bands within 15 degrees and 4 mm
@@ -954,6 +980,10 @@ def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, n
                                xdir=[sgn * math.sin(phi), -sgn * math.cos(phi), 0.0],
                                depth=round(t + sag + 1.0 + straddle + over, 2),
                                polys=[poly], taper=taper))
+        if covered is not None:
+            from shapely.geometry import box as _box
+            covered.append((ang, (g["z"][0] + g["z"][1]) / 2, rm, t,
+                            upoly if upoly is not None else _box(-w / 2, -h / 2, w / 2, h / 2)))
         shape_note = (f"{wf} x {hf} mm floor, corners r {rc}" if upoly is None
                       else f"{'floor' if sgn < 0 else 'plateau'} outline traced from the scan"
                       + (f", wrapped as {len(pieces)} chord facets" if len(pieces) > 1 else ""))

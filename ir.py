@@ -184,33 +184,104 @@ def engrave(name, path, width, depth, side="carve", radius=None, build=False):
             "path": [[round(float(t), 2), round(float(z), 2)] for t, z in path]}
 
 
-def _engrave_prisms(f):
-    """An engrave feature as placed prism segments: one shallow box per path chord, each in its
-    own tangent frame, overlapping its neighbours so the chain has no gaps."""
+def _engrave_outline(f, r):
+    """A line's buffered outline in unwrapped cylinder space (round caps and joins — it is a
+    routed groove) at the group's common radius `r`."""
     import math
-    r, w, d = f["radius"], f["width"], f["depth"]
-    sgn = -1 if f["side"] == "carve" else 1
+    from shapely.geometry import LineString
+    th, pts = 0.0, []
+    for j, (t, z) in enumerate(f["path"]):
+        if j:
+            th += (t - f["path"][j - 1][0] + 180.0) % 360.0 - 180.0
+        else:
+            th = t
+        pts.append((math.radians(th) * r, z))
+    return LineString(pts).buffer(f["width"] / 2).simplify(0.15)
+
+
+def _engrave_layers(engs):
+    """Built engravings expanded as DISJOINT tool regions: per side, lines clustered by the
+    surface radius they sit on (split at 0.6 mm gaps — crossing lines share a surface), and
+    each line's outline differenced against the union of the lines before it, so no two detail
+    booleans ever touch and a crossing belongs to the earlier line."""
     out = []
-    pts = f["path"]
-    for j, (a, b) in enumerate(zip(pts, pts[1:])):
-        ta, tb = math.radians(a[0]), math.radians(b[0])
-        mt, mz = (ta + tb) / 2, (a[1] + b[1]) / 2
-        seg = math.hypot(r * ((tb - ta + math.pi) % (2 * math.pi) - math.pi), b[1] - a[1])
-        if seg < 1e-3:
+    for side in ("carve", "emboss"):
+        group = sorted((f for f in engs if f["side"] == side), key=lambda f: f["radius"])
+        clusters, cur = [], []
+        for f in group:
+            if cur and f["radius"] - cur[-1]["radius"] > 0.6:
+                clusters.append(cur)
+                cur = []
+            cur.append(f)
+        if cur:
+            clusters.append(cur)
+        for cl in clusters:
+            r = sorted(f["radius"] for f in cl)[len(cl) // 2]
+            union = None
+            for f in cl:
+                outline = _engrave_outline(f, r)
+                region = outline if union is None else outline.difference(union)
+                union = outline if union is None else union.union(outline)
+                out.extend(_engrave_prisms(f, r, region))
+    return out
+
+
+def _engrave_prisms(f, r, region):
+    """One engraving's tool `region` (already disjoint from every other line's) as cut/fused
+    solids: split into chord facets of at most 30 degrees, each a placed prism in its own
+    tangent frame. Most lines fit one facet; a wrap-around swoosh takes a few. Cut facets emit
+    last-strip-first and pad facets forward (the orders the strictest kernel accepts)."""
+    import math
+    from shapely.geometry import box
+    w, d = f["width"], f["depth"]
+    sgn = -1 if f["side"] == "carve" else 1
+    polys = [region] if region.geom_type == "Polygon" else \
+        list(region.geoms) if region.geom_type in ("MultiPolygon", "GeometryCollection") else []
+    out = []
+    for upoly in polys:
+        if upoly.geom_type != "Polygon" or upoly.is_empty or upoly.area < 0.5:
             continue
-        ang = math.atan2(b[1] - a[1], r * ((tb - ta + math.pi) % (2 * math.pi) - math.pi))
-        c, s = math.cos(mt), math.sin(mt)
-        half, hw = seg / 2 + w / 4, w / 2
-        ca, sa = math.cos(ang), math.sin(ang)
-        poly = [(u * ca - v * sa, u * sa + v * ca, 0)
-                for u, v in ((-half, -hw), (half, -hw), (half, hw), (-half, hw))]
-        r0 = r + sgn * d
-        out.append({"kind": "prism_cut" if sgn < 0 else "prism_pad",
-                    "name": f"{f['name']}_{j + 1}",
-                    "origin": [round(r0 * c, 6), round(r0 * s, 6), round(mz, 6)],
-                    "normal": [round(sgn * -c, 6), round(sgn * -s, 6), 0.0],
-                    "xdir": [round(sgn * s, 6), round(sgn * -c, 6), 0.0],
-                    "depth": round(d + 1.0, 3), "polys": [[list(p) for p in poly]]})
+        out.extend(_facet_prisms(f, r, d, sgn, upoly, len(out)))
+    return out if sgn > 0 else out[::-1]
+
+
+def _facet_prisms(f, r, d, sgn, upoly, k0):
+    import math
+    from shapely.geometry import box
+    s0, v0, s1, v1 = upoly.bounds
+    W = r * math.radians(30.0)
+    n = max(1, int(math.ceil((s1 - s0) / W)))
+    rp = r + sgn * d
+    out = []
+    for j in range(n):
+        # DISJOINT strips with a 0.2 mm gap, unlike a panel wrap's overlapping ones: a line is
+        # about as wide as any overlap would be, so overlapped facets would nearly duplicate
+        # each other wall-on-wall. The gap leaves a web thinner than scan noise every 30 deg,
+        # and the tools never touch, so no breathing jitter (which would distort the width).
+        clip = upoly.intersection(box(s0 + j * W + 0.1, v0 - 1.0, s0 + (j + 1) * W - 0.1, v1 + 1.0))
+        for piece in (clip.geoms if clip.geom_type == "MultiPolygon" else [clip]):
+            if piece.geom_type != "Polygon" or piece.area < 0.5 or len(piece.exterior.coords) < 4:
+                continue
+            smid = (piece.bounds[0] + piece.bounds[2]) / 2
+            uv = [(rp * math.sin((s - smid) / r), v) for s, v in piece.exterior.coords[:-1]]
+            if sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(uv, uv[1:] + uv[:1])) < 0:
+                uv.reverse()
+            kept = [p for i, p in enumerate(uv) if not i or math.dist(p, uv[i - 1]) >= 0.2]
+            if len(kept) < 3:
+                continue
+            uf = min(max(abs(u) for u, _ in kept), rp)
+            straddle = (rp - math.sqrt(max(rp * rp - uf * uf, 0.0))) / 2
+            sag = r - math.sqrt(max(r * r - min(uf, r) ** 2, 0.0))
+            phi = smid / r                            # unwrapped arc back to an angle about Z
+            c, s = math.cos(phi), math.sin(phi)
+            r0 = rp - straddle
+            out.append({"kind": "prism_cut" if sgn < 0 else "prism_pad",
+                        "name": f"{f['name']}_{k0 + len(out) + 1}",
+                        "origin": [round(r0 * c, 6), round(r0 * s, 6), 0.0],
+                        "normal": [round(sgn * -c, 6), round(sgn * -s, 6), 0.0],
+                        "xdir": [round(sgn * s, 6), round(sgn * -c, 6), 0.0],
+                        "depth": round(d + sag + 1.0 + straddle, 3),
+                        "polys": [[[round(u, 3), round(v, 3), 0] for u, v in kept]]})
     return out
 
 
@@ -237,7 +308,7 @@ def lower(spec):
     import math
     G = _geom()
     out = copy.deepcopy(spec)
-    feats = []                           # patterns and engravings expand first: backends never
+    feats, built_engs = [], []           # patterns and engravings expand first: backends never
     for f in out["features"]:            # see either kind
         if f["kind"] == "pattern":
             src = next(g for g in feats if g.get("name") == f["of"])
@@ -246,9 +317,11 @@ def lower(spec):
                                            f.get("angle_step", 0.0) * i, f.get("z_step", 0.0) * i))
         elif f["kind"] == "engrave":
             if f.get("build"):           # reference detailing stays out of the solid
-                feats.extend(_engrave_prisms(f))
+                built_engs.append(f)
         else:
             feats.append(f)
+    if built_engs:                       # expanded together, as disjoint layers (see _engrave_layers)
+        feats.extend(_engrave_layers(built_engs))
     out["features"] = feats
     zlo = zhi = None                     # the part's extent so far
     sk, pads, made = {}, [], {}          # sketch -> (z0, side, loops); pads; feature name -> record
