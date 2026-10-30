@@ -391,7 +391,8 @@ def _washboard(res, zs, nth, base, dz, base2d=None):
     return sectors
 
 
-def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_000_000):
+def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_000_000,
+                 axis=None, z_range=None):
     """The part's outer skin as a DISPLACEMENT MAP: the surface sampled uniformly (so a CAD
     tessellation's bare flats and a scan's dense shell read alike), only outward-facing points
     kept (an interior wall's normal points inward, so a socket cannot pollute the skin), every
@@ -405,6 +406,10 @@ def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_00
     baseline, and the residual is purely what stands on or sinks into the designed surface.
     k = 0 tracks the stepped radius unsmoothed; the shape harmonics are median-smoothed along z.
 
+    `axis` (an (x, y) centre) and `z_range` ((z0, z1)) pin the frame instead of fitting it from
+    this mesh, so two meshes — a scan and the tree rebuilt from it — map onto the SAME cells and
+    can be subtracted cell for cell (deviation_map.signed_map).
+
     Returns {"axis", "z0", "dz", "nth", "zs", "R", "base", "base_r", "res", "valid"}."""
     import trimesh
     from scipy import ndimage as ndi
@@ -416,7 +421,11 @@ def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_00
         pts, fi = trimesh.sample.sample_surface(mesh, n)
     pts = np.asarray(pts, dtype=np.float64)
     nrm = mesh.face_normals[fi]
-    z0, z1 = float(mesh.bounds[0][2]), float(mesh.bounds[1][2])
+    z0, z1 = (float(mesh.bounds[0][2]), float(mesh.bounds[1][2])) if z_range is None \
+        else (float(z_range[0]), float(z_range[1]))
+    if z_range is not None:
+        inside = (pts[:, 2] >= z0) & (pts[:, 2] < z1)
+        pts, nrm = pts[inside], nrm[inside]
 
     # axis: per 2 mm band, a trimmed Kasa circle fit of the band's points; the median centre
     bands = np.floor((pts[:, 2] - z0) / 2.0).astype(int)
@@ -436,6 +445,8 @@ def displacement(mesh, dz=0.25, nth=720, harmonics=4, density=60.0, max_pts=4_00
             c = np.array([x[0] / 2, x[1] / 2])
         centres.append(c)
     ax = np.median(centres, axis=0) if centres else np.zeros(2)
+    if axis is not None:
+        ax = np.asarray(axis, dtype=np.float64)
 
     dx, dy = pts[:, 0] - ax[0], pts[:, 1] - ax[1]
     r = np.hypot(dx, dy)
@@ -1390,9 +1401,22 @@ def main():
     ap.add_argument("--relief", action="store_true",
                     help="also map the off-axis relief (insets, panels, ribs) and model what fits")
     ap.add_argument("--emit", help="write the measurements (and comparison) as JSON")
+    ap.add_argument("--square", action="store_true",
+                    help="first spin the scan about Z onto its own mirror plane (deviation_map.square_roll); "
+                         "the tree is then in that squared frame — score it against the raw scan with "
+                         "sdf_recognize --spin <minus the reported spin>")
     a = ap.parse_args()
     mesh = load(a.mesh)
+    sq = None
+    if a.square:
+        import deviation_map
+        sq = deviation_map.square_roll(mesh)
+        mesh = deviation_map.spun(mesh, sq["spin_deg"])
+        print(f"square: spun the scan {sq['spin_deg']:+} deg onto its mirror plane "
+              f"(asymmetry {sq['asymmetry_mm']} mm vs typical {sq['typical_mm']}, confidence {sq['confidence']})")
     out = {"mesh": os.path.basename(a.mesh), "measured": measure(mesh)}
+    if sq:
+        out["square"] = sq
     m = out["measured"]
     if a.relief:
         m["relief"] = relief(mesh)

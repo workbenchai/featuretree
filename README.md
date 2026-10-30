@@ -389,6 +389,53 @@ python3 sdf_recognize.py scan.stl --carve 1.5          # no tree: base / added /
   where volumetric overlap lies: cutting the real (but torn) hex socket *lowered* both IoU
   metrics and collapsed the tip's deviation p90 from 4.35 mm to 1.06 mm.
 
+## The signed deviation map — and refining a tree from it
+
+`deviation()` is one number. [`deviation_map.py`](deviation_map.py) keeps the colormap behind it
+and puts it to work: the same loop that took a hand-built model of this screwdriver to a 0.07 mm
+median — *build, map the signed deviation, fix the feature the map blames, rebuild* — as code.
+
+```bash
+python3 deviation_map.py scan.stl --spec tree.json --png dev.png --report dev.json   # map + work list
+python3 deviation_map.py scan.stl --spec tree.json --refine refined.json --iters 3   # close the loop
+python3 deviation_map.py scan.stl --square                     # the roll that squares the scan
+python3 mesh_compare.py scan.stl --square --tree tree.json --relief   # recognise in the squared frame
+```
+
+- `signed_map()` — CAD − scan radius on the same (z, θ) skin grid `displacement()` reads, the tree's
+  skin taken in the **scan's pinned frame** (its axis and z range) so the two subtract cell for cell.
+  Red = the tree stands proud, blue = the tree is low.
+- `attribute()` — the map divided among its owners: each placed feature (patterns expanded) and each
+  base level (its band, minus every placed footprint), ranked by `error_mm3` (∫|dev| over its cells),
+  with which way it leans. Disagreement **no feature owns** comes back as `unexplained` regions —
+  *added* (scan material the tree lacks) or *removed* (tree material the scan refutes) — the
+  recognizer's work list, never modelled here.
+- `render()` — the map as a PNG with the worst features outlined and named.
+- `square_roll()` — the spin putting the scan's mirror plane on θ = 0 (reflection asymmetry of the
+  skin residual, 0.25° steps), with a confidence. A scan rolled off its design axes reads every flat
+  floor as tilted and every mirrored pair as unequal.
+- `refine()` — the map turned into corrections, damped and iterated. A placed feature's **floor**
+  moves along its normal by the deviation on its floor; its **outline** shifts and stretches in (u, v)
+  by the deviation integrated *across* its edges (a strip of one-sided error along an edge is the
+  edge in the wrong place: its integral over the step height is how far — one formula for cuts and
+  bosses, the step's sign tells them apart); pattern instances pool their evidence onto the master.
+  A base level's outline radii follow the deviation of the bare body around it, per angle. Every
+  edit is re-scored on its **own region** after the rebuild and **reverted** if that region got
+  worse — refinement never trades a good feature for a better average.
+
+On the screwdriver tree (`basicsdrill_clean.stl`, 64 features), three passes: map median
+0.257 → 0.165 mm; `deviation()` median **0.254 → 0.188 mm**, p90 0.987 → 0.929 mm, max 3.0 → 2.64 mm
+(p99 1.72 → 1.77 mm); the tree still validates and, rendered against the scan, looks no worse.
+About a third of the proposed edits were reverted by their own regions each pass.
+
+What the map says refinement *cannot* fix, and why p90 barely moves: structure. The grip panels
+are cut into material the scan still has (broad blue on the map), and the nose is a stack of short
+levels and tapered pads where the scan has one smooth taper into the collar. Those are base-concept
+decisions for the recognizer — the per-band base profile competition — and the map is how to judge
+them: a better base concept shows up as blue and red bands disappearing, not as a smaller median.
+Not refined, by design: tapered cone steps, engravings, and any feature kind other than placed
+prisms and untapered levels; all are listed in the report.
+
 ## Ingesting cadgen / text-to-cad assemblies — the editable round-trip for agent-generated CAD
 
 [text-to-cad](https://github.com/earthtojake/text-to-cad) ("CAD Skills", the dominant agent-writes-
