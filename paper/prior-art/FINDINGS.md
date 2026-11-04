@@ -1,5 +1,9 @@
 # Consolidated findings — featuretree: B-rep → verified editable feature tree
 
+> Scope note (2026-11-03): this document covers the STEP → tree pipeline. The scan-side
+> additions (displacement map, deviation metric, detailing-as-features) have their own scan:
+> [FINDINGS-SCAN.md](FINDINGS-SCAN.md).
+
 **Date:** 2026-09-19 · **Status:** all four cells complete (classical AFR, interoperability flank,
 commercial/FTO, patents) + OpenAlex citation-graph traversal over 11 seeds (527 citing works,
 50 citing 2+ seeds).
