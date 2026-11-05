@@ -795,7 +795,7 @@ def _level_profile(lv, rel, radius, npts=72):
     return [pts], round(max(amps), 2)
 
 
-def tree(measured, snap=True):
+def tree(measured, snap=True, core="auto"):
     """A feature tree from measure()'s output, for parts this module can describe: round steps
     stacked along Z, with through holes that are round or regular polygons. Returns (spec, notes).
 
@@ -808,11 +808,21 @@ def tree(measured, snap=True):
     carries a "relief" entry (see relief()), each rectangular-enough recess patch becomes a
     radial prism_cut — a flat-floored inset — while every other patch is a note. With `snap`,
     sizes within 0.3 mm of a 0.5 mm step take that value. Anything it cannot describe raises
-    ValueError or is listed in the notes."""
+    ValueError or is listed in the notes.
+
+    `core` says what a level's radius is where the relief stands proud of its baseline: "auto"
+    re-bases it on the axisymmetric core (right for a ribbed or knurled grip, whose outer ring is
+    the rib envelope); "envelope" keeps the outer surface (right for a smooth moulding with raised
+    panels or bosses: re-based, the body sinks under its own skin, ~0.7 mm on a screwdriver barrel)."""
     import ir as IR
     sn = _snap if snap else (lambda v, *a, **k: round(v, 3))
     notes = []
-    levels = _core_levels(measured["levels"], measured.get("relief"), notes)
+    if core not in ("auto", "envelope"):
+        raise ValueError(f"core must be 'auto' or 'envelope', not {core!r}")
+    levels = (_core_levels(measured["levels"], measured.get("relief"), notes) if core == "auto"
+              else [dict(lv) for lv in measured["levels"]])
+    if core == "envelope":
+        notes.append("levels kept at their outer envelope (core='envelope': a smooth part, not texture)")
     bumpy = [lv for lv in levels if not lv["round"]]
     if not levels or (bumpy and not measured.get("relief")):
         raise ValueError("only parts made of round steps along Z are handled "
@@ -946,6 +956,8 @@ def tree(measured, snap=True):
         feats.append(IR.pocket(name, f"{name}_profile", through=True))
 
     pats = (measured.get("relief") or {}).get("patches", [])
+    if core == "envelope":
+        pats = _patches_on_envelope(pats, levels)
     wash = (measured.get("relief") or {}).get("washboard") or []
     if wash:
         # a washboard sector PREEMPTS its own ridges: each ridge also segments as a little
@@ -1191,6 +1203,28 @@ def _coalesce_patterns(feats, notes):
     return out
 
 
+def _patches_on_envelope(pats, levels):
+    """Relief patches re-measured from the level's outer surface rather than the relief baseline,
+    for core="envelope": the body is built at the envelope, so a recess runs from there to its
+    floor (deeper by the gap) and a boss stands proud of the envelope only by what clears it (a
+    boss no higher than the envelope is already body, and drops out as too shallow)."""
+    out = []
+    for p in pats:
+        zm = (p["z"][0] + p["z"][1]) / 2
+        lv = next((lv for lv in levels if lv["z"][0] <= zm <= lv["z"][1]), None)
+        if lv is None or p["kind"] not in ("recess", "boss"):
+            out.append(p)
+            continue
+        off = lv["outer_diameter"] / 2 - p["mean_radius"]
+        if off <= 0:
+            out.append(p)
+            continue
+        q = dict(p, mean_radius=round(lv["outer_diameter"] / 2, 3))
+        q["depth"] = round(p["depth"] + off if p["kind"] == "recess" else p["depth"] - off, 2)
+        out.append(q)
+    return out
+
+
 def _emit_relief_panels(pats, pkind, sgn, fname, measured, levels, sn, breaks, notes, covered=None):
     """The relief patches of one sign as placed features: recesses (sgn -1) become drafted
     prism_cuts into the body, bosses (sgn +1) become drafted prism_pads standing proud of it —
@@ -1400,6 +1434,9 @@ def main():
     ap.add_argument("--tree", metavar="OUT", help="build a feature tree from the measurements and write it here")
     ap.add_argument("--relief", action="store_true",
                     help="also map the off-axis relief (insets, panels, ribs) and model what fits")
+    ap.add_argument("--envelope", action="store_true",
+                    help="a smooth part: keep each level at its outer surface instead of re-basing it on the "
+                         "relief's core (the default suits ribbed / knurled grips)")
     ap.add_argument("--emit", help="write the measurements (and comparison) as JSON")
     ap.add_argument("--square", action="store_true",
                     help="first spin the scan about Z onto its own mirror plane (deviation_map.square_roll); "
@@ -1441,7 +1478,7 @@ def main():
             print(f"    hole at {h['centre']}: {what}")
     spec = None
     if a.tree:
-        spec, out["notes"] = tree(m)
+        spec, out["notes"] = tree(m, core="envelope" if a.envelope else "auto")
         spec["name"] = os.path.splitext(out["mesh"])[0].lower()
         with open(a.tree, "w") as fh:
             json.dump(spec, fh, indent=1)

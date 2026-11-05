@@ -270,7 +270,8 @@ def run_script(script_path, out_path, save=None, max_drops=8):
         err = (r.stderr or "") + (r.stdout or "")
         m = re.search(r"step (\d+)", err)
         doc = json.loads(Path(script_path).read_text())
-        cmds = doc["commands"]
+        # emit() writes a bare command list; a document form {"commands": [...]} is accepted too
+        cmds = doc["commands"] if isinstance(doc, dict) else doc
         i = int(m.group(1)) - 1 if m else -1
         if not m or not (0 <= i < len(cmds)) or cmds[i]["command"] != "solid.extrude":
             raise RuntimeError(f"solidcraft-cli failed:\n{err}")
@@ -285,7 +286,11 @@ def run_script(script_path, out_path, save=None, max_drops=8):
                     k += 1
                 kill.add(k)
                 break
-        doc["commands"] = [c for j, c in enumerate(cmds) if j not in kill]
+        kept = [c for j, c in enumerate(cmds) if j not in kill]
+        if isinstance(doc, dict):
+            doc["commands"] = kept
+        else:
+            doc = kept
         Path(script_path).write_text(json.dumps(doc, indent=1))
         dropped.append(name)
         print(f"note: SolidCraft refused '{name}' (near-tangent boolean); dropped it and retried")

@@ -214,7 +214,7 @@ def _component_prism(comp, name):
         lb = al.bounding_box()
         cx, cy = 0.5 * (lb.min.X + lb.max.X), 0.5 * (lb.min.Y + lb.max.Y)   # lumps are off-center
         zc = lb.min.Z + 0.5 * lb.size.Z
-        sec = al.intersect(Pos(cx, cy, zc) * Rectangle(lb.size.X + 50, lb.size.Y + 50)).faces()
+        sec = _faces(al.intersect(Pos(cx, cy, zc) * Rectangle(lb.size.X + 50, lb.size.Y + 50)))
         if len(sec) != 1:
             return None
         polys = _face_polys(sec[0])
@@ -544,7 +544,7 @@ def _polyline(wire, max_seg=0.5):
 
 
 def _slice(solid, bb, z):
-    return solid.intersect(Plane.XY.offset(z) * Rectangle(bb.size.X + 50, bb.size.Y + 50)).faces()
+    return _faces(solid.intersect(Plane.XY.offset(z) * Rectangle(bb.size.X + 50, bb.size.Y + 50)))
 
 
 def _ring(faces):
@@ -1261,7 +1261,7 @@ def _recognize_revolve(orig, name):
     R, H = bb.max.X + max(1.0, 0.1 * bb.size.X), bb.size.Z + 2
     zc = (bb.min.Z + bb.max.Z) / 2                          # center the section on the solid's z-range
     half = Plane.XZ * Pos(R / 2, zc, 0) * Rectangle(R, H)   # a face on XZ spanning x in [0, R]
-    faces = solid.intersect(half).faces()
+    faces = _faces(solid.intersect(half))
     if len(faces) != 1:
         raise ValueError(f"revolve meridian has {len(faces)} regions (axial hole etc. — unsupported)")
     merid = faces[0].rotate(Axis((0, 0, 0), (1, 0, 0)), -90)   # XZ (r,axial) -> XY (x=r, y=axial)
@@ -1337,6 +1337,12 @@ def _close(a, b):
     return abs(a[0] - b[0]) < EPS and abs(a[1] - b[1]) < EPS
 
 
+def _faces(section):
+    """A section's faces; none when the cut missed the solid. build123d's intersect returns None
+    (not an empty shape) when the pieces don't meet: a slice exactly on an end face or past it."""
+    return section.faces() if section is not None else []
+
+
 def _wire_xy(wire):
     """A wire's (x, y) bounding-box center, rounded — a stable key for matching the same vertical
     hole across cross-sections at different heights."""
@@ -1351,7 +1357,7 @@ def _through_centroids(solid, base_z, top_z, bb):
     def inner_keys(z):
         cut = Plane.XY.offset(z) * Rectangle(bb.size.X + 50, bb.size.Y + 50)
         keys = set()
-        for ff in solid.intersect(cut).faces():
+        for ff in _faces(solid.intersect(cut)):
             for w in ff.inner_wires():
                 keys.add(_wire_xy(w))
         return keys
@@ -1546,7 +1552,7 @@ def _extrude_along(orig, name, axis, n_bad):
     secs = None
     for frac in FRACS:
         zc = base_z + frac * thick
-        faces = solid.intersect(Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)).faces()
+        faces = _faces(solid.intersect(Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)))
         if len(faces) == 1:
             secs = [faces[0]]
             break
@@ -1559,7 +1565,7 @@ def _extrude_along(orig, name, axis, n_bad):
     if secs is None:
         for frac in FRACS:
             zc = base_z + frac * thick
-            faces = solid.intersect(Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)).faces()
+            faces = _faces(solid.intersect(Plane.XY.offset(zc) * Rectangle(bb.size.X + 50, bb.size.Y + 50)))
             if not (1 < len(faces) <= MAX_REGIONS):
                 continue
             if all(_classify_wire(f.outer_wire(), []) is not None for f in faces):
