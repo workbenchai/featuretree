@@ -1774,6 +1774,13 @@ def _verify(spec, solid, report=None):
     out = {"verified": bool(ok), "vol_orig": round(solid.volume, 1), "vol_ir": res["volume"],
            "dvol": round(dvol, 2), "dvol_pct": round(100 * dvol / max(solid.volume, 1e-9), 2),
            "dsize_mm": round(dsize, 3)}
+    if not ok:                                   # the cheap gates failed: say which, by how much
+        what = []
+        if dvol > VOL_TOL * solid.volume:
+            what.append(f"volume differs by {out['dvol_pct']:g}% (> {100 * VOL_TOL:g}%)")
+        if dsize > DIM_TOL:
+            what.append(f"extents differ by {dsize:.2f} mm (> {DIM_TOL:g} mm)")
+        out["reason"] = "; ".join(what)
     # measured on every NEAR candidate, not only passing ones: when nothing verifies, the returned
     # PARTIAL is the one that overlaps best. Picking the closest VOLUME instead handed back FTC-08
     # at 93.5% overlap over a 98.6% sibling -- volume error is where compensating errors hide.
