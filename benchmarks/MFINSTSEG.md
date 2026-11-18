@@ -51,6 +51,22 @@ Of the overlap-gate rejections, 781 sit at ≥ 99 % overlap and another 1,109 at
 a slightly-wrong feature, not a wrong part. (Relaxing the overlap threshold to 99 % would
 read 32.9 % VERIFIED; we don't, but the sensitivity is worth knowing.)
 
+## What the worst failures look like
+
+The twelve worst failures of the entire run — the eight largest volume misses and the four
+lowest overlaps — original (gray) beside the rebuilt tree (blue), same camera and scale per
+pair:
+
+![Contact sheet of the 12 worst failures](failures_contact_sheet.png)
+
+Three readings. Even at the tail of the distribution most reconstructions are recognizably
+the same part with one wrong feature. Slanted faces recur in the volume misses: large angled
+cutaways come back as square material (the slanted_through_step deficit made visible). And
+the overlap gate is catching real impostors: the 52.6% and 63.2% pairs match volume within
+0.2% yet are different shapes — false accepts under a volume-only metric. Two pairs (the
+18.8% and 63.2% reconstructions) show a distinct wrong-axis failure mode: the recognizer read
+the part along the wrong base profile and built a plausible tree for a different part.
+
 ## What drives failure: complexity, then the step family
 
 **Feature-count decay.** VERIFIED is a conjunction over every feature, so the rate decays
