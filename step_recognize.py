@@ -277,7 +277,7 @@ def _recover_multiaxis(spec, orig, axis, name):
     profile extruded along its OWN axis. All prism_cuts, so the whole thing self-verifies via re-emit.
     Returns (recovered_spec, counts)."""
     feats = list(spec["features"])
-    counts = {"pockets": 0, "holes": 0, "residual_lumps": 0}
+    counts = {"pockets": 0, "holes": 0, "pads": 0, "residual_lumps": 0}
 
     # Work in the EMITTED base's own frame. The base sketch uses the aligned part's own X/Y
     # coordinates and b3d_emit pads it deterministically +Z from z=0, so the two frames differ ONLY
@@ -334,6 +334,34 @@ def _recover_multiaxis(spec, orig, axis, name):
             break                                        # no progress -> stop (rest is chamfers)
         for pf in added:
             counts["holes" if _is_hole_prism(pf) else "pockets"] += 1
+        feats, part = trial, part2
+    # (C) missing material — the symmetric residual: what the INPUT holds and the tree does not
+    # (a blind step's remaining ledge, a web the layering folded away, a boss a shrunk level
+    # dropped). Each clean prismatic component becomes a prism_pad through the same honest
+    # single-profile test as (B)'s cuts; a pad that will not fuse (tangent union) fails the
+    # trial emit and is dropped, and the verification gates judge whatever lands.
+    for _p in range(RECOVER_PASSES):
+        miss = _robust_cut(aligned0, part)
+        if miss is None:
+            break
+        comps = [c for c in miss.solids() if c.volume > RECOVER_EPS]
+        if not comps:
+            break
+        added = []
+        for c in comps:
+            pf = _component_prism(c, f"pad{counts['pads'] + len(added)}")
+            if pf is not None:
+                added.append(dict(pf, kind="prism_pad"))
+        if not added:
+            break
+        trial = feats + added
+        try:
+            part2, _ = b3d_emit.emit(IR.part(name, *trial))
+        except Exception:
+            break                                        # a pad didn't build -> keep what we have
+        if part2.volume <= part.volume + RECOVER_EPS:
+            break                                        # no progress -> stop
+        counts["pads"] += len(added)
         feats, part = trial, part2
     resid = _robust_cut(part, aligned0)
     counts["residual_lumps"] = (len([c for c in resid.solids() if c.volume > RECOVER_EPS])
@@ -1507,7 +1535,9 @@ def _recognize(step_path, name=None, verify=True, recover=True):
     best = min(reports, key=lambda c: _closeness(c[2]))
     if recover:
         for spec, extras, report in reports:
-            if extras.get("method") != "extrude" or extras.get("axis") is None:
+            # layered candidates earn recovery too: a folded-away level (a blind step's ledge)
+            # is exactly a missing-material lump the symmetric residual pass can pad back
+            if extras.get("method") not in ("extrude", "layered") or extras.get("axis") is None:
                 continue
             try:
                 got = _isolated("_recover_file", (spec, str(step_path), tuple(extras["axis"]), name))
@@ -1523,7 +1553,8 @@ def _recognize(step_path, name=None, verify=True, recover=True):
             rreport["recovered"] = counts
             rreport["warnings"].append(
                 f"multi-axis recovery: +{counts['pockets']} pocket(s), +{counts['holes']} "
-                f"cross-hole(s); {counts['residual_lumps']} residual lump(s) (chamfers/fillets) left uncut")
+                f"cross-hole(s), +{counts.get('pads', 0)} missing-material pad(s); "
+                f"{counts['residual_lumps']} residual lump(s) (chamfers/fillets) left uncut")
             if rreport["verified"]:
                 return rspec, rreport
             if _closeness(rreport) < _closeness(best[2]):
@@ -1826,8 +1857,16 @@ def _fixtures(tmp):
                       IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("body", "o", length=6),
                       IR.sketch("b", circles=[(0, 0, 6)], on={"face_of": "body", "side": "top"}),
                       IR.pad("post", "b", length=10))   # revolve (rect base) NOR a clean extrude (post)
+    # BLIND STEP: an edge-open recess that leaves a 6 mm ledge at the plate's edge. Layered
+    # recognition used to model the recess level with the recess-floor profile and drop the
+    # ledge; symmetric recovery must pad it back (the MFInstSeg step-family failure, in one part).
+    ledge = IR.part("ledge",
+                    IR.sketch("o", "XY", rects=[(40, 30, 0, 0)]), IR.pad("body", "o", length=8),
+                    IR.prism_cut("step", origin=(-20, -9, 6), normal=(0, 0, 1), xdir=(1, 0, 0),
+                                 depth=2.5, polys=[[(-1, -1, 0.0), (41, -1, 0.0),
+                                                    (41, 25, 0.0), (-1, 25, 0.0)]]))
     specs = {"plate": IR.SAMPLES["plate"](), "poly": IR.SAMPLES["poly"](),
-             "disc_hole": disc, "boxpost": boxpost}
+             "disc_hole": disc, "boxpost": boxpost, "ledge": ledge}
     paths = {}
     for nm, spec in specs.items():
         part, _ = b3d_emit.emit(spec)
@@ -1889,7 +1928,7 @@ def selftest():
     paths = _fixtures(tempfile.mkdtemp())
     problems = []
     for nm in ("plate", "poly", "disc_hole", "off_axis", "dshape", "cone", "slot",
-               "boxpost"):                                                           # in scope -> VERIFY
+               "boxpost", "ledge"):                                                  # in scope -> VERIFY
         _, rep = recognize(paths[nm])
         print(f"  {nm:10} -> {'VERIFIED' if rep['verified'] else 'PARTIAL'}  "
               f"vol Δ{rep['dvol_pct']}%  (method={rep.get('method')}, thru={rep['through_holes']})")
